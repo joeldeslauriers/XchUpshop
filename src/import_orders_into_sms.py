@@ -7,20 +7,65 @@ import configparser
 import logging
 from datetime import datetime
 import sys
-import tkinter as tk
-from tkinter import ttk
+import ctypes
+
+def get_config_path():
+    script_dir = (
+        os.path.dirname(sys.executable)
+        if getattr(sys, "frozen", False)
+        else os.path.dirname(os.path.abspath(__file__))
+    )
+    return os.path.join(script_dir, "config.ini")
+
+
+def read_debugscreen(config_path: str) -> bool:
+    cfg = configparser.ConfigParser()
+    cfg.read(config_path)
+    return cfg.getint("Settings", "DebugScreen", fallback=0) == 1
+
+
+def ensure_console():
+    """
+    Crée/attache une console Windows (utile quand l'EXE est compilé en --windowed).
+    """
+    if os.name != "nt":
+        return
+
+    kernel32 = ctypes.windll.kernel32
+
+    # Si une console existe déjà (ex: lancé depuis un CMD), ne rien faire
+    if kernel32.GetConsoleWindow():
+        return
+
+    # Crée une console
+    if kernel32.AllocConsole() == 0:
+        return
+
+    # Rebind stdout/stderr vers la nouvelle console
+    sys.stdout = open("CONOUT$", "w", buffering=1, encoding="utf-8", errors="replace")
+    sys.stderr = open("CONOUT$", "w", buffering=1, encoding="utf-8", errors="replace")
+    sys.stdin  = open("CONIN$", "r", encoding="utf-8", errors="replace")
+
+
+# --- UI ---
 import threading
+from queue import Queue
 
-UI_ENABLED = True   # ← tu peux le mettre à False si lancé en silent
-
+UI_ENABLED = True  # False si tu veux silent mode (ex: lancé par SQI sans UI)
 ui = None
+ui_queue = Queue()
+
 if UI_ENABLED:
     from ui_status import StatusUI
 
+
 def status(msg, detail=""):
+    """
+    Logs + sends status to UI (thread-safe via queue).
+    """
     logging.info(msg + (f" | {detail}" if detail else ""))
-    if ui:
-        ui.set(msg, detail)
+    if UI_ENABLED:
+        ui_queue.put((msg, detail))
 
 
 # --------------------------
@@ -33,8 +78,17 @@ base_dir = (
 )
 
 # --------------------------
-# Logging setup (append daily; [HH:MM:SS]: timestamps)
-# Write logs to Log subfolder (create if missing)
+# Config path + DebugScreen (DOIT être avant logging.basicConfig)
+# --------------------------
+config_path = get_config_path()
+debug_console = read_debugscreen(config_path)
+
+# Si on veut voir la console et que l'EXE est windowed, on l'ouvre ici
+if debug_console:
+    ensure_console()
+
+# --------------------------
+# Logging setup
 # --------------------------
 log_ts = datetime.now().strftime("%Y-%m-%d")
 log_filename = f"ImportOrdersIntoSMS_logs_{log_ts}.log"
@@ -52,12 +106,15 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-console = logging.StreamHandler()
-console.setLevel(logging.INFO)
-console.setFormatter(logging.Formatter("[%(asctime)s]: %(message)s", datefmt="%H:%M:%S"))
-logging.getLogger().addHandler(console)
+# StreamHandler seulement si DebugScreen=1
+if debug_console:
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter("[%(asctime)s]: %(message)s", datefmt="%H:%M:%S"))
+    logging.getLogger().addHandler(console)
 
 logging.info("=== Start run ===")
+
 
 # --------------------------
 # Config loading
@@ -71,7 +128,6 @@ script_dir = (
 )
 
 config_path = os.path.join(script_dir, "config.ini")
-
 logging.info(f"Loading config from: {config_path}")
 
 if not os.path.exists(config_path):
@@ -79,13 +135,11 @@ if not os.path.exists(config_path):
 
 config.read(config_path)
 
-# Access values from the "Settings" section
 server_name = config["Settings"]["ServerName"]
 database_name = config["Settings"]["DatabaseName"]
 sql_driver = config["Settings"]["SQLDriver"]
 store_number = int(config["Settings"]["StoreNumber"])
 
-# Access values from the "ImportOrders" section
 base_url = config["ImportOrders"]["BaseUrl"].rstrip("/")
 api_username = config["ImportOrders"]["Username"]
 api_password = config["ImportOrders"]["Password"]
@@ -93,24 +147,20 @@ api_password = config["ImportOrders"]["Password"]
 
 def _get_sql_connection():
     connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database_name};Trusted_Connection=yes"
-    logging.info(f"Connecting to SQL Server '{server_name}', database '{database_name}' ...")
+    status("Connecting to SQL Server...", f"{server_name} / {database_name}")
     conn = pyodbc.connect(connection_string)
-    logging.info("SQL connection established.")
+    status("SQL connection established.")
     return conn
 
 
 def open_and_validate_database_connection():
-    """
-    Open + validate DB connection before calling the API.
-    Returns an OPEN connection for reuse throughout the run.
-    """
-    logging.info("Opening + validating database connectivity before calling API ...")
+    status("Validating database connectivity...")
     conn = _get_sql_connection()
     cur = conn.cursor()
     cur.execute("SELECT 1")
     cur.fetchone()
     cur.close()
-    logging.info("Database connectivity validated successfully.")
+    status("Database connectivity validated.")
     return conn
 
 
@@ -137,12 +187,13 @@ def get_job_id(auth_token):
     }
     payload = {"approved_flag": True, "store_number": [store_number]}
 
-    logging.info("Creating job (export/orders) ...")
+    status("Creating export job...", "Upshop /export/orders")
     response = requests.post(url, headers=headers, json=payload, timeout=90)
     response.raise_for_status()
     resp_json = response.json()
     job_id = resp_json.get("job_id")
-    logging.info(f"Job created successfully. job_id={job_id}")
+
+    status("Job created.", f"job_id={job_id}")
     logging.info(f"Job creation API response: {json.dumps(resp_json)}")
     return job_id
 
@@ -151,27 +202,19 @@ def check_job_status(auth_token, job_id):
     url = f"{base_url}/job_status/{job_id}"
     headers = {"Authorization": f"Bearer {auth_token}"}
 
-    logging.info(f"Checking job status for job_id={job_id} ...")
     response = requests.get(url, headers=headers, timeout=90)
     response.raise_for_status()
-    resp_json = response.json()
-    logging.info(
-        f"Job status retrieved. status={resp_json.get('status')}, item_count={len(resp_json.get('data', []))}"
-    )
-    return resp_json
+    return response.json()
 
 
 def wait_for_job_completion(auth_token, job_id, poll_interval_seconds=5, timeout_seconds=1800):
-    """
-    Poll job status until it reaches a terminal status.
-    Swagger indicates:
-      { "status": "finished", "message": "Job finished" }
-    """
     terminal_success = {"finished"}
     terminal_failure = {"failed", "error", "cancelled", "canceled"}
 
     start = time.time()
     last_status = None
+
+    status("Waiting for job completion...", f"job_id={job_id}")
 
     while True:
         status_payload = check_job_status(auth_token, job_id)
@@ -181,53 +224,37 @@ def wait_for_job_completion(auth_token, job_id, poll_interval_seconds=5, timeout
         message = status_payload.get("message")
 
         if status_val != last_status:
-            logging.info(f"Job status changed: {last_status} -> {status_val} (message={message})")
+            status("Job status changed", f"{last_status} -> {status_val} ({message})")
             last_status = status_val
 
         if status_val in terminal_success:
-            logging.info(f"Job reached terminal SUCCESS status={status_raw}. message={message}")
+            status("Job completed.", message or "")
             return status_payload
 
         if status_val in terminal_failure:
-            logging.error(f"Job reached terminal FAILURE status={status_raw}. message={message}")
             logging.error(f"Final job status payload: {json.dumps(status_payload)}")
             raise RuntimeError(f"Job failed with status={status_raw}. message={message}")
 
         elapsed = time.time() - start
         if elapsed > timeout_seconds:
-            logging.error(
-                f"Timed out waiting for job completion after {int(elapsed)}s. "
-                f"Last status={status_raw}, message={message}"
-            )
             raise TimeoutError(f"Job did not finish within {timeout_seconds}s. Last status={status_raw}")
 
         time.sleep(poll_interval_seconds)
 
 
 def get_vendor_name_cached(conn, vendor_number, vendor_cache):
-    """
-    Cache vendor name per vendor_number.
-    Using: SELECT F334 FROM VENDOR_TAB WHERE F27=?
-    """
     key = safe_str(vendor_number)
 
     if key in vendor_cache:
-        logging.info(f"Vendor cache HIT: vendor_number={vendor_number}")
         return vendor_cache[key]
 
-    logging.info(f"Vendor cache MISS: vendor_number={vendor_number} (querying SQL)")
     try:
         cur = conn.cursor()
         cur.execute("SELECT F334 FROM VENDOR_TAB WHERE F27 = ?", str(vendor_number))
         row = cur.fetchone()
         cur.close()
 
-        vendor_name = ""
-        if row and row[0] is not None:
-            vendor_name = str(row[0]).strip()
-        else:
-            logging.warning(f"Vendor lookup: vendor_number={vendor_number} NOT FOUND")
-
+        vendor_name = str(row[0]).strip() if row and row[0] is not None else ""
         vendor_cache[key] = vendor_name
         return vendor_name
     except Exception as e:
@@ -237,10 +264,6 @@ def get_vendor_name_cached(conn, vendor_number, vendor_cache):
 
 
 def send_rechdr(conn, job_data_entry, vendor_cache):
-    """
-    TMP_REC_BAT: we keep your existing insert.
-    Note: F1032 is set to PO (case_order_number) for now, CGI will dbGen(F1032,1) and replace.
-    """
     cursor = conn.cursor()
 
     case_order_number = job_data_entry.get("case_order_number")
@@ -265,49 +288,35 @@ def send_rechdr(conn, job_data_entry, vendor_cache):
     store_number_string = "00" + str(store_number_local)
 
     values = (
-        sms_order_number,      # F1032 (PO for now)
-        vendor_number,         # F27
-        approval_date,         # F76
-        case_order_number,     # F91
-        approval_date,         # F253
-        effective_date,        # F254
-        vendor_name,           # F334
-        88454,                 # F352
-        121609,                # F1035
-        121609,                # F1036
-        store_number_string,   # F1056
-        "901",                 # F1057
-        "OPEN",                # F1067
-        "ORDER",               # F1068
-        1,                     # F1101
-        757,                   # F1126
-        "Upshop Order",        # F1127
-        effective_date,        # F1246
-        effective_date,        # F1653
+        sms_order_number,
+        vendor_number,
+        approval_date,
+        case_order_number,
+        approval_date,
+        effective_date,
+        vendor_name,
+        88454,
+        121609,
+        121609,
+        store_number_string,
+        "901",
+        "OPEN",
+        "ORDER",
+        1,
+        757,
+        "Upshop Order",
+        effective_date,
+        effective_date,
     )
-
-    logging.info(
-        f"TMP_REC_BAT insert for sms_order_number={sms_order_number}, "
-        f"vendor={vendor_number}, vendor_name='{vendor_name}', "
-        f"approval_date={approval_date}, effective_date={effective_date}"
-    )
-    logging.info(f"TMP_REC_BAT params: {values}")
 
     cursor.execute(query, values)
     conn.commit()
     rows_affected = cursor.rowcount
-    logging.info(f"TMP_REC_BAT insert result: rows_affected={rows_affected}")
-
     cursor.close()
     return rows_affected
 
 
 def send_recdtl(conn, job_data_entry, line_num):
-    """
-    TMP_REC_DTL: NO LOOKUP here (POS/COST/PRICE is done in CGI).
-    We insert the minimum base on the API.
-    IMPORTANT: F1032 is set to PO for now, CGI will replace with dbGen(F1032,1).
-    """
     cursor = conn.cursor()
 
     case_order_number = safe_int(job_data_entry.get("case_order_number"))
@@ -320,54 +329,35 @@ def send_recdtl(conn, job_data_entry, line_num):
     if not sku:
         raise ValueError(f"SKU is empty (PO={case_order_number}, line={line_num})")
 
-    # insert query with only field from API
     insert_query = """
     INSERT INTO [dbo].[TMP_REC_DTL] (
-        [F1032],   -- Transaction number (PO for now)
-        [F1101],   -- Line number
-        [F01],     -- UPC code
-        [F03],     -- Department code
-        [F1003],   -- Case quantity
-        [F1041],   -- Description registration
-        [F1063],   -- Function code
-        [F1067],   -- Registration mode
-        [F1184],   -- Buying format
-        [F1887],   -- Buying format (string)
-        [F75],     -- Case on order
-        [F76]      -- Date order
+        [F1032], [F1101], [F01], [F03], [F1003], [F1041], [F1063], [F1067], [F1184], [F1887], [F75], [F76]
     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
     """
 
     insert_values = (
-        case_order_number,   # F1032 = PO for now
-        safe_int(line_num),  # F1101
-        sku,                 # F01
-        department_number,   # F03
-        float(order_quantity),  # F1003
-        description,         # F1041
-        3510,                # F1063
-        "ITEM",              # F1067
-        "CASE",              # F1184
-        "C",                 # F1887
-        float(order_quantity),  # F75 (case on order)
-        approval_date,       # F76
+        case_order_number,
+        safe_int(line_num),
+        sku,
+        department_number,
+        float(order_quantity),
+        description,
+        3510,
+        "ITEM",
+        "CASE",
+        "C",
+        float(order_quantity),
+        approval_date,
     )
-
-    logging.info(
-        f"TMP_REC_DTL insert for PO={case_order_number}, line={line_num}, sku={sku}, dept={department_number}, qty={order_quantity}"
-    )
-    logging.info(f"TMP_REC_DTL params: {insert_values}")
 
     cursor.execute(insert_query, insert_values)
     conn.commit()
     rows_affected = cursor.rowcount
-    logging.info(f"TMP_REC_DTL insert result: rows_affected={rows_affected}")
-
     cursor.close()
     return rows_affected
 
 
-def main():
+def run_import():
     totals = {
         "hdr_inserts": 0,
         "dtl_inserts": 0,
@@ -377,83 +367,52 @@ def main():
     }
 
     conn = None
-
-    # Cache vendor names only (no item lookup cache)
     vendor_cache = {}
 
     try:
+        status("Opening database connection...")
         conn = open_and_validate_database_connection()
-    except Exception as e:
-        logging.exception(f"Aborting run because database connection validation failed: {e}")
-        logging.info("=== End run ===")
-        return
 
-    try:
-        # --------------------------
         # API: Login
-        # --------------------------
+        status("Connecting to Upshop API...", "Requesting auth token")
         urlt = f"{base_url}/login"
         payloadt = {"username": api_username, "password": api_password}
         headerst = {"Content-Type": "application/json"}
 
-        logging.info("Requesting auth token ...")
         responset = requests.post(urlt, headers=headerst, json=payloadt, timeout=90)
         responset.raise_for_status()
         response_data = responset.json()
         auth_token = response_data.get("access_token")
 
         if not auth_token:
-            logging.error("Auth token missing in response.")
-            return
+            raise RuntimeError("Auth token missing in response.")
 
-        logging.info("Auth token retrieved successfully.")
+        status("Auth token retrieved.")
 
-        # --------------------------
-        # API: Create job + poll until finished
-        # --------------------------
+        # API: Create job + poll
         job_id = get_job_id(auth_token)
-        logging.info(f"Job ID: {job_id}")
-
-        job_status = wait_for_job_completion(
-            auth_token,
-            job_id,
-            poll_interval_seconds=5,
-            timeout_seconds=1800,
-        )
+        job_status = wait_for_job_completion(auth_token, job_id)
 
         data_items = job_status.get("data", [])
-        # Debug: show which POs are in the payload
-        pos = sorted({str(x.get("case_order_number")) for x in data_items if x.get("case_order_number") is not None})
-        vendors = sorted({str(x.get("vendor_number")) for x in data_items if x.get("vendor_number") is not None})
-
-        logging.info(f"Distinct POs in payload: {pos}")
-        logging.info(f"Distinct vendors in payload: {vendors}")
-
-        
-        logging.info(f"Job returned {len(data_items)} item(s).")
+        status("Download complete.", f"{len(data_items)} item(s)")
 
         if not data_items:
-            logging.warning("API returned 0 items. Nothing to import.")
-            return
-        
+            status("No approved orders found.", "Nothing to import")
+            return totals
 
-        # --------------------------
-        # Insert into SMS TMP tables
-        # --------------------------
+        # Insert TMP tables
+        status("Inserting into SMS TMP tables...")
         seen_headers = set()
         line_number = 1
 
         for item in data_items:
             totals["items_seen"] += 1
 
-            qty = item.get("order_quantity")
             sku = item.get("sku")
             po = item.get("case_order_number")
             vendor_case_key = f"{item.get('vendor_number')}{po}"
 
-            logging.info(
-                f"Processing item sku={sku}, qty={qty}, po={po}, vendor_case_key={vendor_case_key}, line={line_number}"
-            )
+            status("Importing item...", f"{line_number}/{len(data_items)} | PO={po} | SKU={sku}")
 
             if vendor_case_key not in seen_headers:
                 try:
@@ -473,15 +432,14 @@ def main():
 
             line_number += 1
 
-    except requests.RequestException as e:
-        logging.exception(f"HTTP error during job workflow: {e}")
-    except Exception as e:
-        logging.exception(f"Unexpected error in main workflow: {e}")
+        status("Import completed.", f"PO(s)={len(seen_headers)} | Items={totals['items_seen']}")
+        return totals
+
     finally:
         if conn is not None:
             try:
                 conn.close()
-                logging.info("SQL connection closed.")
+                status("SQL connection closed.")
             except Exception:
                 logging.exception("Error closing SQL connection.")
 
@@ -491,7 +449,38 @@ def main():
             f"hdr_inserts={totals['hdr_inserts']}, hdr_skipped={totals['hdr_skipped']}, "
             f"dtl_inserts={totals['dtl_inserts']}, dtl_skipped={totals['dtl_skipped']}"
         )
+
+        orders_imported = totals["hdr_inserts"]
+
+        if orders_imported > 0:
+            status(
+            f"{orders_imported} order{'s' if orders_imported > 1 else ''} were imported","You can close this window")
+        else:
+            status("No orders were imported","You can close this window")
+
         logging.info("=== End run ===")
+
+
+def main():
+    if not UI_ENABLED:
+        run_import()
+        return
+
+    # UI mode
+    global ui
+    ui = StatusUI(title="Upshop Import", queue=ui_queue)
+
+    def worker():
+        try:
+            run_import()
+            ui_queue.put(("Done", "You can close this window."))
+            ui.root.after(0, ui.done, "Done", "You can close this window.")
+        except Exception as e:
+            logging.exception(f"Import failed: {e}")
+            ui.root.after(0, ui.error, "Import failed", str(e))
+
+    threading.Thread(target=worker, daemon=True).start()
+    ui.run()
 
 
 if __name__ == "__main__":

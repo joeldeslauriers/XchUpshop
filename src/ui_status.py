@@ -1,10 +1,16 @@
-# ui_status.py
 import tkinter as tk
 from tkinter import ttk
-import threading
+from queue import Empty
+
 
 class StatusUI:
-    def __init__(self, title="Upshop Import"):
+    """
+    Small status window (Tkinter) that stays responsive while work runs in a background thread.
+    Uses a Queue (thread-safe) to receive (msg, detail) updates.
+    """
+
+    def __init__(self, title="Upshop Import", queue=None):
+        self.queue = queue
         self.root = tk.Tk()
         self.root.title(title)
         self.root.resizable(False, False)
@@ -25,15 +31,20 @@ class StatusUI:
         self.pb.pack(fill="x", padx=16, pady=12)
         self.pb.start(10)
 
-        self.close_btn = ttk.Button(
-            self.root, text="Close", command=self.root.destroy, state="disabled"
-        )
+        self.close_btn = ttk.Button(self.root, text="Close", command=self.root.destroy, state="disabled")
         self.close_btn.pack(pady=(0, 10))
+
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close_attempt)
+
+    def _on_close_attempt(self):
+        # block close while still working (optional)
+        if str(self.close_btn["state"]) == "disabled":
+            return
+        self.root.destroy()
 
     def set(self, msg, detail=""):
         self.msg_var.set(msg)
         self.detail_var.set(detail)
-        self.root.update_idletasks()
 
     def done(self, msg="Done", detail=""):
         self.pb.stop()
@@ -46,11 +57,23 @@ class StatusUI:
         self.set(msg, detail)
         self.close_btn.configure(state="normal")
 
-    def run_background(self, func):
-        def wrapper():
+    def pump_queue(self):
+        """
+        Pull UI updates from queue every 100ms.
+        """
+        if self.queue is not None:
             try:
-                func()
-            except Exception as e:
-                self.error("Import failed", str(e))
-        threading.Thread(target=wrapper, daemon=True).start()
+                while True:
+                    msg, detail = self.queue.get_nowait()
+                    self.set(msg, detail)
+            except Empty:
+                pass
+
+        self.root.after(100, self.pump_queue)
+
+    def run(self):
+        """
+        Start UI loop. Call pump_queue() before mainloop to enable queue updates.
+        """
+        self.pump_queue()
         self.root.mainloop()
