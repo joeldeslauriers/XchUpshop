@@ -8,6 +8,20 @@ import logging
 from datetime import datetime
 import sys
 import ctypes
+from requests.exceptions import HTTPError, Timeout, RequestException
+from http_errors import HTTP_ERROR_MESSAGES
+
+# --- UI ---
+import threading
+from queue import Queue
+
+UI_ENABLED = True  # False si tu veux silent mode (ex: lancé par SQI sans UI)
+ui = None
+ui_queue = Queue()
+
+if UI_ENABLED:
+    from ui_status import StatusUI
+
 
 def get_config_path():
     script_dir = (
@@ -26,46 +40,114 @@ def read_debugscreen(config_path: str) -> bool:
 
 def ensure_console():
     """
-    Crée/attache une console Windows (utile quand l'EXE est compilé en --windowed).
+    Crée une console Windows (utile quand l'EXE est compilé en --windowed).
     """
     if os.name != "nt":
         return
 
     kernel32 = ctypes.windll.kernel32
 
-    # Si une console existe déjà (ex: lancé depuis un CMD), ne rien faire
     if kernel32.GetConsoleWindow():
         return
 
-    # Crée une console
     if kernel32.AllocConsole() == 0:
         return
 
-    # Rebind stdout/stderr vers la nouvelle console
     sys.stdout = open("CONOUT$", "w", buffering=1, encoding="utf-8", errors="replace")
     sys.stderr = open("CONOUT$", "w", buffering=1, encoding="utf-8", errors="replace")
     sys.stdin  = open("CONIN$", "r", encoding="utf-8", errors="replace")
 
 
-# --- UI ---
-import threading
-from queue import Queue
-
-UI_ENABLED = True  # False si tu veux silent mode (ex: lancé par SQI sans UI)
-ui = None
-ui_queue = Queue()
-
-if UI_ENABLED:
-    from ui_status import StatusUI
-
-
 def status(msg, detail=""):
-    """
-    Logs + sends status to UI (thread-safe via queue).
-    """
     logging.info(msg + (f" | {detail}" if detail else ""))
     if UI_ENABLED:
-        ui_queue.put((msg, detail))
+        ui_queue.put(("INFO", msg, detail))
+
+
+def ui_error(msg, detail=""):
+    logging.error(msg + (f" | {detail}" if detail else ""))
+    if UI_ENABLED:
+        ui_queue.put(("ERROR", msg, detail))
+
+
+def ui_warn(msg, detail=""):
+    logging.warning(msg + (f" | {detail}" if detail else ""))
+    if UI_ENABLED:
+        ui_queue.put(("WARN", msg, detail))
+
+
+def explain_http_exception(exc: Exception, context: str = ""):
+    """
+    Convert requests HTTP/timeout errors into user-friendly UI messages using HTTP_ERROR_MESSAGES.
+    Returns: (title, detail)
+    """
+    prefix = (context + " | ") if context else ""
+
+    # Timeout
+    if isinstance(exc, Timeout):
+        return ("Request timeout", prefix + "The API did not respond in time. Try again or check network/VPN/firewall.")
+
+    # HTTP status code
+    if isinstance(exc, HTTPError):
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
+
+        # Log the body for troubleshooting (safe truncate)
+        try:
+            if resp is not None:
+                body = (resp.text or "")[:2000]
+                logging.error(f"{prefix}HTTP {code} response body (first 2000 chars): {body}")
+        except Exception:
+            pass
+
+        if code in HTTP_ERROR_MESSAGES:
+            t = HTTP_ERROR_MESSAGES[code]["title"]
+            d = HTTP_ERROR_MESSAGES[code]["detail"]
+            return (t, prefix + d)
+
+        return (f"HTTP Error {code}", prefix + str(exc))
+
+    # Other request errors (DNS, TLS, connection refused, proxy, etc.)
+    if isinstance(exc, RequestException):
+        return ("Network error", prefix + str(exc))
+
+    # fallback
+    return ("Error", prefix + str(exc))
+
+
+def request_json(method: str, url: str, *, headers=None, json_body=None, timeout=90, context=""):
+    """
+    Unified request helper that:
+      - runs requests.<method>
+      - raise_for_status
+      - returns response.json()
+      - on error: maps to friendly message (http_errors.py) + ui_error + re-raises
+    """
+    try:
+        m = method.strip().lower()
+        if m == "get":
+            resp = requests.get(url, headers=headers, timeout=timeout)
+        elif m == "post":
+            resp = requests.post(url, headers=headers, json=json_body, timeout=timeout)
+        else:
+            raise ValueError(f"Unsupported HTTP method: {method}")
+
+        resp.raise_for_status()
+
+        # JSON parse
+        try:
+            return resp.json()
+        except Exception as je:
+            # Sometimes API returns HTML/text on error pages
+            body = (resp.text or "")[:2000]
+            logging.error(f"{context} | JSON parse failed. Body (first 2000 chars): {body}")
+            ui_error("Invalid API response", f"{context} | Response is not valid JSON.")
+            raise je
+
+    except Exception as e:
+        title, detail = explain_http_exception(e, context)
+        ui_error(title, detail)
+        raise
 
 
 # --------------------------
@@ -83,7 +165,6 @@ base_dir = (
 config_path = get_config_path()
 debug_console = read_debugscreen(config_path)
 
-# Si on veut voir la console et que l'EXE est windowed, on l'ouvre ici
 if debug_console:
     ensure_console()
 
@@ -106,7 +187,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-# StreamHandler seulement si DebugScreen=1
 if debug_console:
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
@@ -114,7 +194,6 @@ if debug_console:
     logging.getLogger().addHandler(console)
 
 logging.info("=== Start run ===")
-
 
 # --------------------------
 # Config loading
@@ -188,11 +267,9 @@ def get_job_id(auth_token):
     payload = {"approved_flag": True, "store_number": [store_number]}
 
     status("Creating export job...", "Upshop /export/orders")
-    response = requests.post(url, headers=headers, json=payload, timeout=90)
-    response.raise_for_status()
-    resp_json = response.json()
-    job_id = resp_json.get("job_id")
+    resp_json = request_json("post", url, headers=headers, json_body=payload, timeout=90, context="Upshop /export/orders")
 
+    job_id = resp_json.get("job_id")
     status("Job created.", f"job_id={job_id}")
     logging.info(f"Job creation API response: {json.dumps(resp_json)}")
     return job_id
@@ -202,9 +279,7 @@ def check_job_status(auth_token, job_id):
     url = f"{base_url}/job_status/{job_id}"
     headers = {"Authorization": f"Bearer {auth_token}"}
 
-    response = requests.get(url, headers=headers, timeout=90)
-    response.raise_for_status()
-    return response.json()
+    return request_json("get", url, headers=headers, timeout=90, context=f"Upshop /job_status/{job_id}")
 
 
 def wait_for_job_completion(auth_token, job_id, poll_interval_seconds=5, timeout_seconds=1800):
@@ -233,16 +308,16 @@ def wait_for_job_completion(auth_token, job_id, poll_interval_seconds=5, timeout
 
         if status_val in terminal_failure:
             logging.error(f"Final job status payload: {json.dumps(status_payload)}")
+            ui_error("Upshop job failed", f"status={status_raw} | message={message}")
             raise RuntimeError(f"Job failed with status={status_raw}. message={message}")
 
         elapsed = time.time() - start
         if elapsed > timeout_seconds:
+            ui_error("Upshop job timeout", f"Last status={status_raw} | waited={timeout_seconds}s")
             raise TimeoutError(f"Job did not finish within {timeout_seconds}s. Last status={status_raw}")
 
         time.sleep(poll_interval_seconds)
 
-
-#Extract the Vendor name from the vendor tab, could be done in CGI but nice to have in the TMP table
 
 def get_vendor_name_cached(conn, vendor_number, vendor_cache):
     key = safe_str(vendor_number)
@@ -262,9 +337,10 @@ def get_vendor_name_cached(conn, vendor_number, vendor_cache):
     except Exception as e:
         logging.exception(f"Vendor lookup failed for vendor_number={vendor_number}: {e}")
         vendor_cache[key] = ""
+        ui_warn("Vendor lookup failed", f"vendor={vendor_number} | {e}")
         return ""
 
-# Insert the API data into TMP_REC_BAT
+
 def send_rechdr(conn, job_data_entry, vendor_cache):
     cursor = conn.cursor()
 
@@ -275,7 +351,6 @@ def send_rechdr(conn, job_data_entry, vendor_cache):
     vendor_number = job_data_entry.get("vendor_number")
 
     vendor_name = get_vendor_name_cached(conn, vendor_number, vendor_cache)
-
     sms_order_number = str(case_order_number)
 
     query = """
@@ -317,7 +392,7 @@ def send_rechdr(conn, job_data_entry, vendor_cache):
     cursor.close()
     return rows_affected
 
-# Insert the API data into TMP_REC_DTL
+
 def send_recdtl(conn, job_data_entry, line_num):
     cursor = conn.cursor()
 
@@ -358,7 +433,7 @@ def send_recdtl(conn, job_data_entry, line_num):
     cursor.close()
     return rows_affected
 
-# Import summary
+
 def run_import():
     totals = {
         "hdr_inserts": 0,
@@ -381,12 +456,18 @@ def run_import():
         payloadt = {"username": api_username, "password": api_password}
         headerst = {"Content-Type": "application/json"}
 
-        responset = requests.post(urlt, headers=headerst, json=payloadt, timeout=90)
-        responset.raise_for_status()
-        response_data = responset.json()
-        auth_token = response_data.get("access_token")
+        response_data = request_json(
+            "post",
+            urlt,
+            headers=headerst,
+            json_body=payloadt,
+            timeout=90,
+            context="Upshop /login"
+        )
 
+        auth_token = response_data.get("access_token")
         if not auth_token:
+            ui_error("Auth token missing", "Upshop /login response has no access_token")
             raise RuntimeError("Auth token missing in response.")
 
         status("Auth token retrieved.")
@@ -403,9 +484,7 @@ def run_import():
             status("No approved orders found.", "0 order / 0 item.")
             return totals
 
-      
-
-        # Insert item inTMP tables
+        # Insert item in TMP tables
         status("Inserting into SMS TMP tables...")
         seen_headers = set()
         line_number = 1
@@ -427,6 +506,7 @@ def run_import():
                 except Exception as e:
                     totals["hdr_skipped"] += 1
                     logging.exception(f"Skipped TMP_REC_BAT for sku={sku}: {e}")
+                    ui_error("Skipped TMP_REC_BAT", f"PO={po} | SKU={sku} | {e}")
 
             try:
                 inserted = send_recdtl(conn, item, line_number)
@@ -434,8 +514,15 @@ def run_import():
             except Exception as e:
                 totals["dtl_skipped"] += 1
                 logging.exception(f"Skipped TMP_REC_DTL for sku={sku}: {e}")
+                ui_error("Skipped TMP_REC_DTL", f"PO={po} | line={line_number} | SKU={sku} | {e}")
 
             line_number += 1
+
+        if totals["hdr_skipped"] or totals["dtl_skipped"]:
+            ui_warn(
+                "Import finished with skipped rows",
+                f"hdr_skipped={totals['hdr_skipped']} | dtl_skipped={totals['dtl_skipped']}"
+            )
 
         status("Import completed.", f"PO(s)={len(seen_headers)} | Items={totals['items_seen']}")
         return totals
@@ -456,12 +543,13 @@ def run_import():
         )
 
         orders_imported = totals["hdr_inserts"]
-
         if orders_imported > 0:
             status(
-            f"{orders_imported} order{'s' if orders_imported > 1 else ''} were imported","You can close this window")
+                f"{orders_imported} order{'s' if orders_imported > 1 else ''} were imported",
+                "You can close this window"
+            )
         else:
-            status("No orders were imported","You can close this window")
+            status("No orders were imported", "You can close this window")
 
         logging.info("=== End run ===")
 
@@ -501,6 +589,5 @@ def main():
     ui.run()
 
 
-    
 if __name__ == "__main__":
     main()

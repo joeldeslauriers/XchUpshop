@@ -455,6 +455,7 @@
   ('http.server',
    'C:\\Users\\Capit\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\http\\server.py',
    'PYMODULE'),
+  ('http_errors', 'C:\\XchUpshop\\src\\http_errors.py', 'PYMODULE'),
   ('idna',
    'C:\\XchUpshop\\.venv\\Lib\\site-packages\\idna\\__init__.py',
    'PYMODULE'),
