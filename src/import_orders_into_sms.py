@@ -242,6 +242,8 @@ def wait_for_job_completion(auth_token, job_id, poll_interval_seconds=5, timeout
         time.sleep(poll_interval_seconds)
 
 
+#Extract the Vendor name from the vendor tab, could be done in CGI but nice to have in the TMP table
+
 def get_vendor_name_cached(conn, vendor_number, vendor_cache):
     key = safe_str(vendor_number)
 
@@ -262,7 +264,7 @@ def get_vendor_name_cached(conn, vendor_number, vendor_cache):
         vendor_cache[key] = ""
         return ""
 
-
+# Insert the API data into TMP_REC_BAT
 def send_rechdr(conn, job_data_entry, vendor_cache):
     cursor = conn.cursor()
 
@@ -315,7 +317,7 @@ def send_rechdr(conn, job_data_entry, vendor_cache):
     cursor.close()
     return rows_affected
 
-
+# Insert the API data into TMP_REC_DTL
 def send_recdtl(conn, job_data_entry, line_num):
     cursor = conn.cursor()
 
@@ -356,7 +358,7 @@ def send_recdtl(conn, job_data_entry, line_num):
     cursor.close()
     return rows_affected
 
-
+# Import summary
 def run_import():
     totals = {
         "hdr_inserts": 0,
@@ -397,10 +399,13 @@ def run_import():
         status("Download complete.", f"{len(data_items)} item(s)")
 
         if not data_items:
-            status("No approved orders found.", "Nothing to import")
+            totals["items_seen"] = 0
+            status("No approved orders found.", "0 order / 0 item.")
             return totals
 
-        # Insert TMP tables
+      
+
+        # Insert item inTMP tables
         status("Inserting into SMS TMP tables...")
         seen_headers = set()
         line_number = 1
@@ -466,15 +471,28 @@ def main():
         run_import()
         return
 
-    # UI mode
     global ui
     ui = StatusUI(title="Upshop Import", queue=ui_queue)
 
     def worker():
         try:
-            run_import()
-            ui_queue.put(("Done", "You can close this window."))
-            ui.root.after(0, ui.done, "Done", "You can close this window.")
+            totals = run_import()
+
+            orders_imported = totals.get("hdr_inserts", 0)
+            items_seen = totals.get("items_seen", 0)
+
+            if items_seen == 0:
+                title = "No approved orders"
+                detail = "0 order / 0 item. You can close this window."
+            elif orders_imported == 0:
+                title = "No orders imported"
+                detail = f"{items_seen} item(s) downloaded but 0 order imported. You can close this window."
+            else:
+                title = "Done"
+                detail = f"{orders_imported} order(s) were imported. You can close this window."
+
+            ui.root.after(0, ui.done, title, detail)
+
         except Exception as e:
             logging.exception(f"Import failed: {e}")
             ui.root.after(0, ui.error, "Import failed", str(e))
@@ -483,5 +501,6 @@ def main():
     ui.run()
 
 
+    
 if __name__ == "__main__":
     main()

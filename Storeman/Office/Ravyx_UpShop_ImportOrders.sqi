@@ -1,15 +1,15 @@
 
 /* check if TMP table exist if not  created it if it does drop them */
-@FMT(CMP,@dbHot(FINDTABLE,TMP_REC_BAT)=,,"®dbExec(DROP TABLE TMP_REC_BAT)");
+@FMT(CMP,@dbHot(FINDTABLE,TMP_REC_BAT)=,,"ï¿½dbExec(DROP TABLE TMP_REC_BAT)");
 
-@FMT(CMP,@dbHot(FINDTABLE,TMP_REC_DTL)=,,"®dbExec(DROP TABLE TMP_REC_DTL)");
+@FMT(CMP,@dbHot(FINDTABLE,TMP_REC_DTL)=,,"ï¿½dbExec(DROP TABLE TMP_REC_DTL)");
 
 @dbExec(SELECT * INTO TMP_REC_BAT FROM REC_BAT WHERE 1=0);
 
 @dbExec(SELECT * INTO TMP_REC_DTL FROM REC_REG WHERE 1=0);
 
 /* Run the driver to retrieve the order */
-@EXEC(EXE='C:\StoreManPlum\XchUpShop\ImportOrdersIntoSMS.exe');
+@EXEC(EXE='@RUNXchUpShop\ImportOrdersIntoSMS.exe');
 
 
 @EXEC(CGI=Ravyx_UpShop_ImportOrders_Generate);
@@ -20,4 +20,4 @@
 
 @dbTable(Q1,SELECT COUNT(*) AS F01 FROM REC_BAT WHERE F1032 IS NOT NULL);
 
-@FMT(CMP,@dbRow(Q1,F01,#)=0,'@FMT(CHR,27)','®EXEC(FCT=3211)');
+@FMT(CMP,@dbRow(Q1,F01,#)=0,'@FMT(CHR,27)','ï¿½EXEC(FCT=3211)');
