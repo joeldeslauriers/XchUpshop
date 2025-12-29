@@ -55,7 +55,7 @@ def ensure_console():
 
     sys.stdout = open("CONOUT$", "w", buffering=1, encoding="utf-8", errors="replace")
     sys.stderr = open("CONOUT$", "w", buffering=1, encoding="utf-8", errors="replace")
-    sys.stdin  = open("CONIN$", "r", encoding="utf-8", errors="replace")
+    sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
 
 
 def status(msg, detail=""):
@@ -138,7 +138,6 @@ def request_json(method: str, url: str, *, headers=None, json_body=None, timeout
         try:
             return resp.json()
         except Exception as je:
-            # Sometimes API returns HTML/text on error pages
             body = (resp.text or "")[:2000]
             logging.error(f"{context} | JSON parse failed. Body (first 2000 chars): {body}")
             ui_error("Invalid API response", f"{context} | Response is not valid JSON.")
@@ -256,6 +255,87 @@ def safe_str(v):
     if v is None:
         return ""
     return str(v).strip()
+
+
+def _clip(s: str, n: int) -> str:
+    s = "" if s is None else str(s)
+    s = s.strip()
+    return s[:n]
+
+
+def po_key(item) -> tuple[str, str]:
+    """
+    Key for 1 row per PO (Upshop) + Vendor.
+    F91 = case_order_number (varchar20)
+    F27 = vendor_number (varchar14)
+    """
+    f91 = _clip(item.get("case_order_number"), 20)
+    f27 = _clip(item.get("vendor_number"), 14)
+    return f91, f27
+
+
+# --------------------------
+# PO Status (1 row per PO)
+# Table: dbo.Ravyx_PO_Status
+# Key logical: (F91, F27)
+# PY writes with F1032=0, CGI reconciles later by updating F1032 via (F91,F27)
+# --------------------------
+def upsert_po_status(
+    conn,
+    *,
+    f91: str,
+    f27: str,
+    step: str = "Order Import",
+    vendor_name: str = "",
+    status_txt: str = "SUCCESS",
+    message: str = "",
+    dept: int | None = None,
+    f1032: int = 0,
+):
+    f91 = _clip(f91, 20)
+    f27 = _clip(f27, 14)
+    step = _clip(step, 40)
+    vendor_name = _clip(vendor_name, 40)
+    status_txt = _clip(status_txt, 60)
+
+    # ✅ Si SUCCESS: F1081 doit être vide (NULL)
+    if (status_txt or "").strip().upper() == "SUCCESS":
+        message_db = None
+    else:
+        message_db = _clip(message, 5000)
+
+    now = datetime.now()
+
+    cur = conn.cursor()
+
+    sql = """
+    MERGE dbo.RAVYX_PO_STATUS AS T
+    USING (SELECT ? AS F91, ? AS F27) AS S
+      ON (T.F91 = S.F91 AND T.F27 = S.F27)
+    WHEN MATCHED THEN
+      UPDATE SET
+        T.F254  = ?,
+        T.F02   = ?,
+        T.F29   = ?,
+        T.F1081 = ?,
+        T.F334  = ?,
+        T.F03   = COALESCE(?, T.F03),
+        T.F1032 = CASE WHEN (T.F1032 IS NULL OR T.F1032 = 0) THEN ? ELSE T.F1032 END
+    WHEN NOT MATCHED THEN
+      INSERT (F1032, F91, F02, F27, F334, F254, F29, F1081, F03)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+
+    params = (
+        f91, f27,
+        now, step, status_txt, message_db, vendor_name, dept, int(f1032),
+        int(f1032), f91, step, f27, vendor_name, now, status_txt, message_db, dept
+    )
+
+    cur.execute(sql, params)
+    conn.commit()
+    cur.close()
+
 
 
 def get_job_id(auth_token):
@@ -456,18 +536,48 @@ def run_import():
         payloadt = {"username": api_username, "password": api_password}
         headerst = {"Content-Type": "application/json"}
 
-        response_data = request_json(
-            "post",
-            urlt,
-            headers=headerst,
-            json_body=payloadt,
-            timeout=90,
-            context="Upshop /login"
-        )
+        # If login fails, we don't have PO yet => write a single "global" row (F91='0',F27='0')
+        try:
+            response_data = request_json(
+                "post",
+                urlt,
+                headers=headerst,
+                json_body=payloadt,
+                timeout=90,
+                context="Upshop /login",
+            )
+        except Exception as e:
+            title, detail = explain_http_exception(e, "Upshop /login")
+            try:
+                upsert_po_status(
+                    conn,
+                    f91="0",
+                    f27="0",
+                    step="Order Import",
+                    status_txt="FAILED",
+                    message=f"{title} | {detail}",
+                    f1032=0,
+                )
+            except Exception:
+                pass
+            raise
 
         auth_token = response_data.get("access_token")
         if not auth_token:
-            ui_error("Auth token missing", "Upshop /login response has no access_token")
+            msg = "Upshop /login response has no access_token"
+            ui_error("Auth token missing", msg)
+            try:
+                upsert_po_status(
+                    conn,
+                    f91="0",
+                    f27="0",
+                    step="Order Import",
+                    status_txt="FAILED",
+                    message=msg,
+                    f1032=0,
+                )
+            except Exception:
+                pass
             raise RuntimeError("Auth token missing in response.")
 
         status("Auth token retrieved.")
@@ -482,9 +592,50 @@ def run_import():
         if not data_items:
             totals["items_seen"] = 0
             status("No approved orders found.", "0 order / 0 item.")
+            # optional global status row
+            try:
+                upsert_po_status(
+                    conn,
+                    f91="0",
+                    f27="0",
+                    step="Order Import",
+                    status_txt="SUCCESS",
+                    message="No approved orders found",
+                    f1032=0,
+                )
+            except Exception:
+                pass
             return totals
 
-        # Insert item in TMP tables
+        # Build unique order list (1 row per PO+Vendor)
+        orders = {}
+        for it in data_items:
+            f91, f27 = po_key(it)
+            if not f91 or not f27:
+                continue
+            if (f91, f27) not in orders:
+                orders[(f91, f27)] = it
+
+        # Initialize status rows (1 per PO)
+        for (f91, f27), it in orders.items():
+            vendor_name = get_vendor_name_cached(conn, f27, vendor_cache)
+            dept_no = safe_int(it.get("department_number"), None)
+            try:
+                upsert_po_status(
+                    conn,
+                    f91=f91,
+                    f27=f27,
+                    step="Order Import",
+                    vendor_name=vendor_name,
+                    status_txt="SUCCESS",
+                    message="Import started (waiting final result)",
+                    dept=dept_no,
+                    f1032=0,
+                )
+            except Exception as e:
+                logging.exception(f"Failed to init PO status (F91={f91},F27={f27}): {e}")
+
+        # Insert items in TMP tables
         status("Inserting into SMS TMP tables...")
         seen_headers = set()
         line_number = 1
@@ -492,22 +643,57 @@ def run_import():
         for item in data_items:
             totals["items_seen"] += 1
 
-            sku = item.get("sku")
-            po = item.get("case_order_number")
-            vendor_case_key = f"{item.get('vendor_number')}{po}"
+            sku = safe_str(item.get("sku"))
+            po = safe_str(item.get("case_order_number"))
+            dept_no = safe_int(item.get("department_number"), None)
+            vendor_no = safe_str(item.get("vendor_number"))  # F27
+            f91 = _clip(po, 20)
+            f27 = _clip(vendor_no, 14)
+
+            vendor_name = get_vendor_name_cached(conn, vendor_no, vendor_cache)
+
+            vendor_case_key = f"{vendor_no}{po}"
 
             status("Importing item...", f"{line_number}/{len(data_items)} | PO={po} | SKU={sku}")
 
+            # header insert (once per vendor+po)
             if vendor_case_key not in seen_headers:
                 try:
                     inserted = send_rechdr(conn, item, vendor_cache)
                     totals["hdr_inserts"] += inserted if inserted else 0
                     seen_headers.add(vendor_case_key)
+
+                    # Update single row per PO
+                    upsert_po_status(
+                        conn,
+                        f91=f91,
+                        f27=f27,
+                        step="Order Import",
+                        vendor_name=vendor_name,
+                        status_txt="SUCCESS",
+                        message="Header inserted in TMP_REC_BAT",
+                        dept=dept_no,
+                        f1032=0,
+                    )
+
                 except Exception as e:
                     totals["hdr_skipped"] += 1
                     logging.exception(f"Skipped TMP_REC_BAT for sku={sku}: {e}")
                     ui_error("Skipped TMP_REC_BAT", f"PO={po} | SKU={sku} | {e}")
 
+                    upsert_po_status(
+                        conn,
+                        f91=f91,
+                        f27=f27,
+                        step="Order Import",
+                        vendor_name=vendor_name,
+                        status_txt="FAILED",
+                        message=f"Header insert failed: {e}",
+                        dept=dept_no,
+                        f1032=0,
+                    )
+
+            # detail insert (each line) - do NOT write status per line (keeps 1 row per PO)
             try:
                 inserted = send_recdtl(conn, item, line_number)
                 totals["dtl_inserts"] += inserted if inserted else 0
@@ -516,7 +702,40 @@ def run_import():
                 logging.exception(f"Skipped TMP_REC_DTL for sku={sku}: {e}")
                 ui_error("Skipped TMP_REC_DTL", f"PO={po} | line={line_number} | SKU={sku} | {e}")
 
+                # if any line fails => mark PO as FAILED and keep message
+                upsert_po_status(
+                    conn,
+                    f91=f91,
+                    f27=f27,
+                    step="Order Import",
+                    vendor_name=vendor_name,
+                    status_txt="FAILED",
+                    message=f"Detail insert failed (line={line_number}, sku={sku}): {e}",
+                    dept=dept_no,
+                    f1032=0,
+                )
+
             line_number += 1
+
+        # Finalize success message for POs that are not failed
+        for (f91, f27), it in orders.items():
+            vendor_name = get_vendor_name_cached(conn, f27, vendor_cache)
+            dept_no = safe_int(it.get("department_number"), None)
+            try:
+                # Only overwrite message if still SUCCESS (can't easily check without SELECT, so we keep it simple)
+                upsert_po_status(
+                    conn,
+                    f91=f91,
+                    f27=f27,
+                    step="Order Import",
+                    vendor_name=vendor_name,
+                    status_txt="SUCCESS",
+                    message="Imported in TMP tables (waiting DBGEN in CGI)",
+                    dept=dept_no,
+                    f1032=0,
+                )
+            except Exception:
+                pass
 
         if totals["hdr_skipped"] or totals["dtl_skipped"]:
             ui_warn(
@@ -524,7 +743,7 @@ def run_import():
                 f"hdr_skipped={totals['hdr_skipped']} | dtl_skipped={totals['dtl_skipped']}"
             )
 
-        status("Import completed.", f"PO(s)={len(seen_headers)} | Items={totals['items_seen']}")
+        status("Import completed.", f"PO(s)={len(orders)} | Items={totals['items_seen']}")
         return totals
 
     finally:
