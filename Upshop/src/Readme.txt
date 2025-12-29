@@ -1,0 +1,1 @@
+ .\.venv\Scripts\python.exe -m PyInstaller `  --onefile `  --windowed `  --name ImportOrdersIntoSMS `  --version-file version_info.txt `  src\import_orders_into_sms.py
