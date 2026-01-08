@@ -142,6 +142,15 @@ class StatusUI:
                         if level in ("WARN", "ERROR"):
                             self._append_message(level, msg, detail)
 
+                            # ✅ allow user to close if any error occurs
+                            if level == "ERROR":
+                                try:
+                                    self.pb.stop()
+                                except Exception:
+                                    pass
+                                self.close_btn.configure(state="normal")
+
+
                         # optional: if you send DONE through queue
                         if level == "DONE":
                             self.done(msg, detail)

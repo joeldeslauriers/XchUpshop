@@ -31,6 +31,14 @@ IS_FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = os.path.dirname(sys.executable) if IS_FROZEN else os.path.dirname(os.path.abspath(__file__))
 
 # =============================================================================
+# RUN ID (NEW)
+# Each execution gets a unique "global" key so RUN FAILED / API errors do NOT overwrite previous runs.
+# Stored in F91 for global/system rows; F27 stays "0".
+# =============================================================================
+
+RUN_ID = datetime.now().strftime("%y%m%d%H%M%S")  # <= 12 chars, safe for F91 (20)
+
+# =============================================================================
 # CONFIG / FLAGS
 # =============================================================================
 
@@ -258,6 +266,7 @@ if debug_console:
 
 logging.info("=== Start run ===")
 logging.info(f"BASE_DIR={BASE_DIR}")
+logging.info(f"RUN_ID={RUN_ID}")
 
 # =============================================================================
 # CONFIG VALUES
@@ -417,10 +426,8 @@ def upsert_po_status(
     f1032: int = 0,
 ):
     """
-    NOTE:
-    - Your table currently stores row-per-PO (F1032/F91/F27 etc.)
-    - We keep "system/global" rows with F91='0', F27='0', F1032=0
-    - We avoid NULL inserts since your F1032 cannot be NULL (PK dependency)
+    Writes one row per (F91,F27). For "global/system" messages we now use (RUN_ID,"0")
+    so each run keeps history instead of overwriting the previous run.
     """
     f91 = _clip(f91, 20)
     f27 = _clip(f27, 14)
@@ -428,6 +435,7 @@ def upsert_po_status(
     vendor_name = _clip(vendor_name, 60)
     status_txt = _clip(status_txt, 60)
 
+    # Keep F1081 NULL on SUCCESS (your current table shows NULL)
     message_db = None if (status_txt or "").strip().upper() == "SUCCESS" else _clip(message, 5000)
     now = datetime.now()
 
@@ -480,13 +488,16 @@ def upsert_po_status(
 
 
 def log_api_error_to_status(conn, endpoint: str, exc: Exception):
+    """
+    Writes API errors to RAVYX_PO_STATUS (global/system row for THIS run: F91=RUN_ID, F27='0').
+    """
     if conn is None:
         return
     try:
         title, detail = explain_http_exception(exc, endpoint)
         upsert_po_status(
             conn,
-            f91="0",
+            f91=RUN_ID,
             f27="0",
             step=_clip(endpoint, 40),
             vendor_name="",
@@ -691,8 +702,7 @@ def run_import():
         "items_seen": 0,
         "hdr_skipped": 0,
         "dtl_skipped": 0,
-        # NEW: list of PO imported successfully
-        "po_imported_ok": [],
+        "po_imported_ok": [],  # list of PO imported successfully
     }
 
     conn = None
@@ -725,7 +735,7 @@ def run_import():
             try:
                 upsert_po_status(
                     conn,
-                    f91="0",
+                    f91=RUN_ID,
                     f27="0",
                     step="Upshop /login",
                     status_txt="FAILED",
@@ -744,7 +754,7 @@ def run_import():
             try:
                 upsert_po_status(
                     conn,
-                    f91="0",
+                    f91=RUN_ID,
                     f27="0",
                     step="Upshop /login",
                     status_txt="FAILED",
@@ -781,7 +791,7 @@ def run_import():
             try:
                 upsert_po_status(
                     conn,
-                    f91="0",
+                    f91=RUN_ID,
                     f27="0",
                     step="Order Import",
                     status_txt="SUCCESS",
@@ -902,9 +912,18 @@ def run_import():
 
             line_number += 1
 
+        # Final per-order message: success or partial failure
         for (f91, f27), it in orders.items():
             vendor_name = get_vendor_name_cached(conn, f27, vendor_cache)
             dept_no = safe_int(it.get("department_number"), None)
+
+            if (f91, f27) in po_errors:
+                final_status = "FAILED"
+                final_msg = "Imported with errors (some rows skipped)"
+            else:
+                final_status = "SUCCESS"
+                final_msg = "Imported in TMP tables (waiting DBGEN in CGI)"
+
             try:
                 upsert_po_status(
                     conn,
@@ -912,8 +931,8 @@ def run_import():
                     f27=f27,
                     step="Order Import",
                     vendor_name=vendor_name,
-                    status_txt="SUCCESS",
-                    message="Imported in TMP tables (waiting DBGEN in CGI)",
+                    status_txt=final_status,
+                    message=final_msg,
                     dept=dept_no,
                     f1032=0,
                 )
@@ -926,7 +945,7 @@ def run_import():
                 f"hdr_skipped={totals['hdr_skipped']} | dtl_skipped={totals['dtl_skipped']}",
             )
 
-        # NEW: list PO imported successfully (those that are NOT in po_errors)
+        # List PO imported successfully (those that are NOT in po_errors)
         imported_ok: List[str] = []
         for (f91, f27) in orders.keys():
             if (f91, f27) not in po_errors:
@@ -1004,7 +1023,7 @@ def main():
             def on_done():
                 ui.done(title, detail)
 
-                # NEW: show imported PO numbers in the listbox (requires ui_status.py add_message())
+                # Show imported PO numbers in the listbox (requires ui_status.py to have add_message())
                 try:
                     if po_ok:
                         max_show = 40
@@ -1019,8 +1038,7 @@ def main():
                             ui.add_message("INFO", "Imported PO", f"... (+{remaining} more)")
                     else:
                         ui.add_message("INFO", "No successful PO", "None")
-                except Exception as _:
-                    # If ui_status.py wasn't updated yet, don't crash the UI.
+                except Exception:
                     pass
 
                 start_auto_close_countdown(ui, AUTO_CLOSE_SECONDS)
