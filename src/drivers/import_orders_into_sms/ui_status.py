@@ -1,5 +1,3 @@
-# ui_status.py
-
 import tkinter as tk
 from tkinter import ttk
 from queue import Empty
@@ -20,7 +18,7 @@ class StatusUI:
         self.root = tk.Tk()
         self.root.title(title)
         self.root.resizable(False, False)
-        self.root.geometry("680x360")
+        self.root.geometry("680x360")  # bigger to show errors
         self.root.attributes("-topmost", True)
 
         self.msg_var = tk.StringVar(value="Starting...")
@@ -30,31 +28,25 @@ class StatusUI:
         self.errors_count = 0
         self.warn_count = 0
 
-        ttk.Label(self.root, text="Upshop Order Import", font=("Segoe UI", 12, "bold")).pack(pady=(10, 4))
-        ttk.Label(self.root, textvariable=self.msg_var, font=("Segoe UI", 10)).pack()
+        ttk.Label(
+            self.root, text="Upshop Order Import", font=("Segoe UI", 12, "bold")
+        ).pack(pady=(10, 4))
 
-        # Detail (wrap + multi-line friendly)
-        self.detail_label = ttk.Label(
-            self.root,
-            textvariable=self.detail_var,
-            font=("Segoe UI", 9),
-            wraplength=640,
-            justify="left",
-        )
-        self.detail_label.pack(padx=16)
+        ttk.Label(self.root, textvariable=self.msg_var, font=("Segoe UI", 10)).pack()
+        ttk.Label(self.root, textvariable=self.detail_var, font=("Segoe UI", 9)).pack()
 
         self.pb = ttk.Progressbar(self.root, mode="indeterminate")
         self.pb.pack(fill="x", padx=16, pady=(12, 8))
         self.pb.start(10)
 
-        # ---- Messages area
+        # ---- Messages area (errors/warnings + info like imported PO list)
         frame = ttk.Frame(self.root)
         frame.pack(fill="both", expand=True, padx=16, pady=(0, 8))
 
         header = ttk.Frame(frame)
         header.pack(fill="x", pady=(0, 4))
 
-        ttk.Label(header, text="Messages (errors/warnings):", font=("Segoe UI", 9, "bold")).pack(side="left")
+        ttk.Label(header, text="Messages:", font=("Segoe UI", 9, "bold")).pack(side="left")
         ttk.Label(header, textvariable=self.count_var, font=("Segoe UI", 9)).pack(side="right")
 
         self.listbox = tk.Listbox(frame, height=10)
@@ -72,6 +64,7 @@ class StatusUI:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_attempt)
 
     def _on_close_attempt(self):
+        # block close while still working (optional)
         if str(self.close_btn["state"]) == "disabled":
             return
         self.root.destroy()
@@ -100,6 +93,10 @@ class StatusUI:
 
         self._refresh_counts()
 
+    # ✅ NEW: used by main.py to show success PO list (INFO lines)
+    def add_message(self, level: str, msg: str, detail: str = ""):
+        self._append_message(level, msg, detail)
+
     def set(self, msg, detail=""):
         self.msg_var.set(msg)
         self.detail_var.set(detail)
@@ -108,13 +105,12 @@ class StatusUI:
         self.pb.stop()
         self.pb.configure(mode="determinate", value=100)
         self.set(msg, detail)
-
-        # do NOT auto-append summary here (main.py already sends the final summary)
         self.close_btn.configure(state="normal")
 
     def error(self, msg="Error", detail=""):
         self.pb.stop()
         self.set(msg, detail)
+        # also push into list so it's not lost
         self._append_message("ERROR", msg, detail)
         self.close_btn.configure(state="normal")
 
@@ -146,13 +142,13 @@ class StatusUI:
                         if level in ("WARN", "ERROR"):
                             self._append_message(level, msg, detail)
 
-                        # IMPORTANT: don't call done() from queue unless you really send DONE
+                        # optional: if you send DONE through queue
                         if level == "DONE":
                             self.done(msg, detail)
 
                         continue
 
-                    # fallback
+                    # fallback: unknown payload -> show it
                     self.set(str(item), "")
 
             except Empty:
@@ -161,5 +157,8 @@ class StatusUI:
         self.root.after(100, self.pump_queue)
 
     def run(self):
+        """
+        Start UI loop. Call pump_queue() before mainloop to enable queue updates.
+        """
         self.pump_queue()
         self.root.mainloop()

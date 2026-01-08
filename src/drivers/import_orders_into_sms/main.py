@@ -1,10 +1,6 @@
 # main.py (import_orders_into_sms)
-# Shared is a real Python package (src/shared/__init__.py)
-# This version is SAFE to import (no config/logging executed at import time)
-# and is robust when SMS launches from a weird working directory.
 
 import os
-import re
 import sys
 import time
 import json
@@ -13,49 +9,26 @@ import logging
 import threading
 import configparser
 from queue import Queue
-from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Set, Tuple
+from typing import Optional, Dict, Set, Tuple, List
 
 import requests
 import pyodbc
 from requests.exceptions import HTTPError, Timeout, RequestException
 
 # =============================================================================
-# PATHS / IMPORTS (make sure src/ is in sys.path BEFORE importing shared.*)
+# IMPORTANT: shared is a PACKAGE now:
+#   src/shared/__init__.py
+#   src/shared/http_errors.py
+# =============================================================================
+from shared.http_errors import HTTP_ERROR_MESSAGES
+
+# =============================================================================
+# BASE DIR
 # =============================================================================
 
 IS_FROZEN = getattr(sys, "frozen", False)
-
-# BASE_DIR = folder containing this file (or EXE folder if frozen)
 BASE_DIR = os.path.dirname(sys.executable) if IS_FROZEN else os.path.dirname(os.path.abspath(__file__))
-
-# In dev: src/drivers/import_orders_into_sms/main.py -> src is 3 levels up
-#   BASE_DIR = ...\src\drivers\import_orders_into_sms
-#   SRC_ROOT = ...\src
-SRC_ROOT = os.path.abspath(os.path.join(BASE_DIR, "..", "..", ".."))
-
-# For frozen EXE, usually shared will be bundled (or you’ll keep same structure under runtime root)
-# If you keep src structure on disk, SRC_ROOT can still be found by walking up.
-def _find_src_root(start: str) -> str:
-    cur = os.path.abspath(start)
-    for _ in range(8):
-        if os.path.isdir(os.path.join(cur, "shared")) and os.path.isdir(os.path.join(cur, "drivers")):
-            return cur
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
-    return SRC_ROOT
-
-SRC_ROOT = _find_src_root(SRC_ROOT)
-
-if SRC_ROOT not in sys.path:
-    sys.path.insert(0, SRC_ROOT)
-
-# Now shared imports are reliable
-from shared.http_errors import HTTP_ERROR_MESSAGES
-from shared.SMTP_Mail import send_email_smtp
 
 # =============================================================================
 # CONFIG / FLAGS
@@ -71,67 +44,20 @@ ui = None
 ui_queue = Queue()
 
 # =============================================================================
-# RUNTIME GLOBALS (initialized at runtime, NOT at import)
-# =============================================================================
-
-CONFIG_PATH = None
-config = None
-
-server_name = None
-database_name = None
-sql_driver = None
-store_number = None
-
-base_url = None
-api_username = None
-api_password = None
-
-LOG_PURGE_DAYS = 0
-REPORT_PURGE_DAYS = 0
-
-# =============================================================================
 # PATH HELPERS
 # =============================================================================
 
-def find_config_path(base_dir: str) -> str:
-    """
-    Find config.ini robustly:
-    1) next to main.py (BASE_DIR)
-    2) walk up parents (ex: ...\src, ...\XchUpshop)
-    3) last resort: current working directory
-    """
-    candidates = []
-
-    # 1) base_dir
-    candidates.append(os.path.join(base_dir, "config.ini"))
-
-    # 2) walk up
-    cur = os.path.abspath(base_dir)
-    for _ in range(8):
-        candidates.append(os.path.join(cur, "config.ini"))
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
-
-    # 3) cwd
-    candidates.append(os.path.join(os.getcwd(), "config.ini"))
-
-    for p in candidates:
-        if os.path.exists(p):
-            return p
-
-    # helpful error
-    tried = "\n".join(candidates[:12])
-    raise FileNotFoundError(f"config.ini not found. Tried:\n{tried}")
+def get_config_path() -> str:
+    # config.ini must be next to the EXE or the script
+    return os.path.join(BASE_DIR, "config.ini")
 
 # =============================================================================
 # SETTINGS / PARSERS
 # =============================================================================
 
-def read_debugscreen(cfg_path: str) -> bool:
+def read_debugscreen(config_path: str) -> bool:
     cfg = configparser.ConfigParser()
-    cfg.read(cfg_path, encoding="utf-8")
+    cfg.read(config_path, encoding="utf-8")
 
     raw = cfg.get("Settings", "DebugScreen", fallback="0")
     raw = (raw or "").strip()
@@ -295,66 +221,59 @@ def request_json(method: str, url: str, *, headers=None, json_body=None, timeout
         raise
 
 # =============================================================================
-# RUNTIME INIT (config + logging + globals)  <-- CRITICAL FIX
+# LOGGING SETUP
 # =============================================================================
 
-def init_runtime():
-    global CONFIG_PATH, config
-    global server_name, database_name, sql_driver, store_number
-    global base_url, api_username, api_password
-    global LOG_PURGE_DAYS, REPORT_PURGE_DAYS
+CONFIG_PATH = get_config_path()
+if not os.path.exists(CONFIG_PATH):
+    raise FileNotFoundError(f"config.ini not found at: {CONFIG_PATH}")
 
-    if CONFIG_PATH is not None:
-        return  # already initialized
+config = configparser.ConfigParser()
+config.read(CONFIG_PATH, encoding="utf-8")
 
-    CONFIG_PATH = find_config_path(BASE_DIR)
+debug_console = read_debugscreen(CONFIG_PATH)
+if debug_console:
+    ensure_console()
 
-    cfg = configparser.ConfigParser()
-    cfg.read(CONFIG_PATH, encoding="utf-8")
-    config = cfg
+log_ts = datetime.now().strftime("%Y-%m-%d")
+log_filename = f"ImportOrdersIntoSMS_logs_{log_ts}.log"
 
-    debug_console = read_debugscreen(CONFIG_PATH)
-    if debug_console:
-        ensure_console()
+log_dir = os.path.join(BASE_DIR, "Log")
+os.makedirs(log_dir, exist_ok=True)
+log_path = os.path.join(log_dir, log_filename)
 
-    log_ts = datetime.now().strftime("%Y-%m-%d")
-    log_filename = f"ImportOrdersIntoSMS_logs_{log_ts}.log"
+logging.basicConfig(
+    filename=log_path,
+    filemode="a",
+    level=logging.INFO,
+    format="[%(asctime)s]: %(message)s",
+    datefmt="%H:%M:%S",
+)
 
-    log_dir = os.path.join(BASE_DIR, "Log")
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, log_filename)
+if debug_console:
+    console = logging.StreamHandler()
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter("[%(asctime)s]: %(message)s", datefmt="%H:%M:%S"))
+    logging.getLogger().addHandler(console)
 
-    logging.basicConfig(
-        filename=log_path,
-        filemode="a",
-        level=logging.INFO,
-        format="[%(asctime)s]: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+logging.info("=== Start run ===")
+logging.info(f"BASE_DIR={BASE_DIR}")
 
-    if debug_console:
-        console = logging.StreamHandler()
-        console.setLevel(logging.INFO)
-        console.setFormatter(logging.Formatter("[%(asctime)s]: %(message)s", datefmt="%H:%M:%S"))
-        logging.getLogger().addHandler(console)
+# =============================================================================
+# CONFIG VALUES
+# =============================================================================
 
-    logging.info("=== Start run ===")
-    logging.info(f"BASE_DIR={BASE_DIR}")
-    logging.info(f"SRC_ROOT={SRC_ROOT}")
-    logging.info(f"CONFIG_PATH={CONFIG_PATH}")
+server_name = config["Settings"]["ServerName"]
+database_name = config["Settings"]["DatabaseName"]
+sql_driver = config["Settings"]["SQLDriver"]
+store_number = int(config["Settings"]["StoreNumber"])
 
-    # Config values
-    server_name = cfg["Settings"]["ServerName"]
-    database_name = cfg["Settings"]["DatabaseName"]
-    sql_driver = cfg["Settings"]["SQLDriver"]
-    store_number = int(cfg["Settings"]["StoreNumber"])
+base_url = config["ImportOrders"]["BaseUrl"].rstrip("/")
+api_username = config["ImportOrders"]["Username"]
+api_password = config["ImportOrders"]["Password"]
 
-    base_url = cfg["ImportOrders"]["BaseUrl"].rstrip("/")
-    api_username = cfg["ImportOrders"]["Username"]
-    api_password = cfg["ImportOrders"]["Password"]
-
-    LOG_PURGE_DAYS = _get_cfg_int(cfg, "Settings", "LogPurge", 0)
-    REPORT_PURGE_DAYS = _get_cfg_int(cfg, "Settings", "ReportPurge", 0)
+LOG_PURGE_DAYS = _get_cfg_int(config, "Settings", "LogPurge", 0)
+REPORT_PURGE_DAYS = _get_cfg_int(config, "Settings", "ReportPurge", 0)
 
 # =============================================================================
 # PURGE FUNCTIONS
@@ -497,14 +416,23 @@ def upsert_po_status(
     dept: Optional[int] = None,
     f1032: int = 0,
 ):
+    """
+    NOTE:
+    - Your table currently stores row-per-PO (F1032/F91/F27 etc.)
+    - We keep "system/global" rows with F91='0', F27='0', F1032=0
+    - We avoid NULL inserts since your F1032 cannot be NULL (PK dependency)
+    """
     f91 = _clip(f91, 20)
     f27 = _clip(f27, 14)
     step = _clip(step, 40)
-    vendor_name = _clip(vendor_name, 40)
+    vendor_name = _clip(vendor_name, 60)
     status_txt = _clip(status_txt, 60)
 
     message_db = None if (status_txt or "").strip().upper() == "SUCCESS" else _clip(message, 5000)
     now = datetime.now()
+
+    f1032_i = safe_int(f1032, 0)
+    dept_i = None if dept is None else safe_int(dept, 0)
 
     cur = conn.cursor()
     sql = """
@@ -526,29 +454,49 @@ def upsert_po_status(
     """
 
     params = (
-        f91,
-        f27,
-        now,
-        step,
-        status_txt,
-        message_db,
-        vendor_name,
-        dept,
-        int(f1032),
-        int(f1032),
-        f91,
-        step,
-        f27,
-        vendor_name,
-        now,
-        status_txt,
-        message_db,
-        dept,
+        f91,         # S.F91
+        f27,         # S.F27
+        now,         # update: F254
+        step,        # update: F02
+        status_txt,  # update: F29
+        message_db,  # update: F1081
+        vendor_name, # update: F334
+        dept_i,      # update: F03
+        f1032_i,     # update: F1032 (if empty)
+        f1032_i,     # insert: F1032
+        f91,         # insert: F91
+        step,        # insert: F02
+        f27,         # insert: F27
+        vendor_name, # insert: F334
+        now,         # insert: F254
+        status_txt,  # insert: F29
+        message_db,  # insert: F1081
+        dept_i,      # insert: F03
     )
 
     cur.execute(sql, params)
     conn.commit()
     cur.close()
+
+
+def log_api_error_to_status(conn, endpoint: str, exc: Exception):
+    if conn is None:
+        return
+    try:
+        title, detail = explain_http_exception(exc, endpoint)
+        upsert_po_status(
+            conn,
+            f91="0",
+            f27="0",
+            step=_clip(endpoint, 40),
+            vendor_name="",
+            status_txt="FAILED",
+            message=f"{title} | {detail}",
+            dept=None,
+            f1032=0,
+        )
+    except Exception:
+        logging.exception("Failed to write API error to RAVYX_PO_STATUS")
 
 # =============================================================================
 # UPSHOP API
@@ -611,139 +559,6 @@ def wait_for_job_completion(auth_token, job_id, poll_interval_seconds=5, timeout
         time.sleep(poll_interval_seconds)
 
 # =============================================================================
-# Email + Dept lookup
-# =============================================================================
-
-@dataclass
-class EmailSettings:
-    enabled: bool
-    smtp_host: str
-    smtp_port: int
-    use_tls: bool
-    smtp_user: Optional[str]
-    smtp_password: Optional[str]
-    sender: str
-    subject_prefix: str
-
-
-def load_email_settings(cfg_path: str) -> EmailSettings:
-    cfg = configparser.ConfigParser()
-    cfg.read(cfg_path, encoding="utf-8")
-
-    enabled = cfg.getint("Email", "Enabled", fallback=0) == 1
-
-    smtp_host = cfg.get("Email", "SmtpHost", fallback="").strip()
-    smtp_port = cfg.getint("Email", "SmtpPort", fallback=587)
-    use_tls = cfg.getint("Email", "UseTLS", fallback=1) == 1
-
-    smtp_user = cfg.get("Email", "SmtpUser", fallback="").strip() or None
-    smtp_password = cfg.get("Email", "SmtpPassword", fallback="").strip() or None
-    sender = cfg.get("Email", "Sender", fallback="").strip()
-    subject_prefix = cfg.get("Email", "SubjectPrefix", fallback="").strip()
-
-    return EmailSettings(
-        enabled=enabled,
-        smtp_host=smtp_host,
-        smtp_port=smtp_port,
-        use_tls=use_tls,
-        smtp_user=smtp_user,
-        smtp_password=smtp_password,
-        sender=sender,
-        subject_prefix=subject_prefix,
-    )
-
-
-def validate_email_settings(es: EmailSettings) -> None:
-    if not es.enabled:
-        return
-
-    missing = []
-    if not es.smtp_host:
-        missing.append("SmtpHost")
-    if not es.smtp_port:
-        missing.append("SmtpPort")
-    if not es.sender:
-        missing.append("Sender")
-
-    if missing:
-        raise ValueError(f"[Email] config invalid, missing: {', '.join(missing)}")
-
-
-DEPT_EMAIL_FIELD = "F2660"
-ALLOWED_DEPT_EMAIL_FIELDS = {DEPT_EMAIL_FIELD}
-
-
-def _is_valid_email(s: str) -> bool:
-    s = (s or "").strip()
-    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", s))
-
-
-def get_department_email(conn, dept_f03: int, dept_email_field: str) -> Optional[str]:
-    if dept_email_field not in ALLOWED_DEPT_EMAIL_FIELDS:
-        raise ValueError("dept_email_field not allowed (security)")
-
-    cur = conn.cursor()
-    sql = f"SELECT {dept_email_field} FROM DEPT_TAB WHERE F03 = ?"
-    row = cur.execute(sql, dept_f03).fetchone()
-    cur.close()
-
-    if not row or row[0] is None:
-        return None
-
-    email = str(row[0]).strip()
-    return email if _is_valid_email(email) else None
-
-
-def build_success_email(po_number: str, vendor_number: str, dept_f03: int) -> Tuple[str, str]:
-    subject = f"PO {po_number} imported successfully"
-    body = (
-        "Upshop order import completed successfully.\n\n"
-        f"PO: {po_number}\n"
-        f"Vendor: {vendor_number}\n"
-        f"Department (F03): {dept_f03}\n"
-        f"Imported at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-    )
-    return subject, body
-
-
-def send_success_email_for_po(
-    *,
-    conn,
-    cfg_path: str,
-    po_number: str,
-    vendor_number: str,
-    dept_f03: int,
-):
-    es = load_email_settings(cfg_path)
-    validate_email_settings(es)
-
-    if not es.enabled:
-        logging.info("Email disabled (config).")
-        return
-
-    to_addr = get_department_email(conn, dept_f03, DEPT_EMAIL_FIELD)
-    if not to_addr:
-        logging.warning(f"No valid email found for DEPT_TAB F03={dept_f03} (field={DEPT_EMAIL_FIELD})")
-        return
-
-    subject, body = build_success_email(po_number, vendor_number, dept_f03)
-    if es.subject_prefix:
-        subject = f"{es.subject_prefix} - {subject}"
-
-    send_email_smtp(
-        smtp_host=es.smtp_host,
-        smtp_port=es.smtp_port,
-        smtp_user=es.smtp_user,
-        smtp_password=es.smtp_password,
-        use_tls=es.use_tls,
-        sender=es.sender,
-        to_addrs=[to_addr],
-        subject=subject,
-        body_text=body,
-    )
-    logging.info(f"Success email sent to {to_addr} for PO={po_number} F03={dept_f03}")
-
-# =============================================================================
 # VENDOR LOOKUP
 # =============================================================================
 
@@ -767,7 +582,6 @@ def get_vendor_name_cached(conn, vendor_number, vendor_cache: Dict[str, str]) ->
         vendor_cache[key] = ""
         ui_warn("Vendor lookup failed", f"vendor={vendor_number} | {e}")
         return ""
-
 
 # =============================================================================
 # TMP TABLE INSERTS
@@ -797,25 +611,25 @@ def send_rechdr(conn, job_data_entry, vendor_cache: Dict[str, str]):
     store_number_string = "00" + str(store_number_local)
 
     values = (
-        sms_order_number,
-        vendor_number,
-        approval_date,
-        case_order_number,
-        approval_date,
-        effective_date,
-        vendor_name,
-        88454,
-        121609,
-        121609,
-        store_number_string,
-        "901",
-        "OPEN",
-        "ORDER",
-        1,
-        757,
-        "Upshop Order",
-        effective_date,
-        effective_date,
+        sms_order_number,            # F1032
+        vendor_number,               # F27
+        approval_date,               # F76
+        case_order_number,           # F91
+        approval_date,               # F253
+        effective_date,              # F254
+        vendor_name,                 # F334
+        88454,                       # F352
+        121609,                      # F1035
+        121609,                      # F1036
+        store_number_string,         # F1056
+        "901",                       # F1057
+        "OPEN",                      # F1067
+        "ORDER",                     # F1068
+        1,                           # F1101
+        757,                         # F1126
+        "Upshop Order",              # F1127
+        effective_date,              # F1246
+        effective_date,              # F1653
     )
 
     cursor.execute(query, values)
@@ -846,18 +660,18 @@ def send_recdtl(conn, job_data_entry, line_num):
     """
 
     insert_values = (
-        case_order_number,
-        safe_int(line_num),
-        sku,
-        department_number,
-        float(order_quantity),
-        description,
-        3510,
-        "ITEM",
-        "CASE",
-        "C",
-        float(order_quantity),
-        approval_date,
+        case_order_number,           # F1032
+        safe_int(line_num),          # F1101
+        sku,                         # F01
+        department_number,           # F03
+        float(order_quantity),       # F1003
+        description,                 # F1041
+        3510,                        # F1063
+        "ITEM",                      # F1067
+        "CASE",                      # F1184
+        "C",                         # F1887
+        float(order_quantity),       # F75
+        approval_date,               # F76
     )
 
     cursor.execute(insert_query, insert_values)
@@ -871,9 +685,15 @@ def send_recdtl(conn, job_data_entry, line_num):
 # =============================================================================
 
 def run_import():
-    init_runtime()  # <--- CRITICAL: do config/logging only when running for real
-
-    totals = {"hdr_inserts": 0, "dtl_inserts": 0, "items_seen": 0, "hdr_skipped": 0, "dtl_skipped": 0}
+    totals = {
+        "hdr_inserts": 0,
+        "dtl_inserts": 0,
+        "items_seen": 0,
+        "hdr_skipped": 0,
+        "dtl_skipped": 0,
+        # NEW: list of PO imported successfully
+        "po_imported_ok": [],
+    }
 
     conn = None
     vendor_cache: Dict[str, str] = {}
@@ -882,7 +702,7 @@ def run_import():
     po_first_dept: Dict[Tuple[str, str], int] = {}
 
     try:
-        upshop_log_dir = os.path.join(BASE_DIR, "XchUpshop", "log")
+        upshop_log_dir = os.path.join(BASE_DIR, "log")
         purge_log_files(upshop_log_dir, LOG_PURGE_DAYS)
 
         status("Opening database connection...")
@@ -895,20 +715,62 @@ def run_import():
         payloadt = {"username": api_username, "password": api_password}
         headerst = {"Content-Type": "application/json"}
 
-        response_data = request_json(
-            "post", urlt, headers=headerst, json_body=payloadt, timeout=90, context="Upshop /login"
-        )
+        # --- LOGIN ---
+        try:
+            response_data = request_json(
+                "post", urlt, headers=headerst, json_body=payloadt, timeout=90, context="Upshop /login"
+            )
+        except Exception as e:
+            title, detail = explain_http_exception(e, "Upshop /login")
+            try:
+                upsert_po_status(
+                    conn,
+                    f91="0",
+                    f27="0",
+                    step="Upshop /login",
+                    status_txt="FAILED",
+                    message=f"{title} | {detail}",
+                    dept=None,
+                    f1032=0,
+                )
+            except Exception:
+                pass
+            raise
 
         auth_token = response_data.get("access_token")
         if not auth_token:
             msg = "Upshop /login response has no access_token"
             ui_error("Auth token missing", msg)
+            try:
+                upsert_po_status(
+                    conn,
+                    f91="0",
+                    f27="0",
+                    step="Upshop /login",
+                    status_txt="FAILED",
+                    message=msg,
+                    dept=None,
+                    f1032=0,
+                )
+            except Exception:
+                pass
             raise RuntimeError("Auth token missing in response.")
 
         status("Auth token retrieved.")
 
-        job_id = get_job_id(auth_token)
-        job_status = wait_for_job_completion(auth_token, job_id)
+        # --- CREATE EXPORT JOB ---
+        try:
+            job_id = get_job_id(auth_token)
+        except Exception as e:
+            log_api_error_to_status(conn, "Upshop /export/orders", e)
+            raise
+
+        # --- WAIT FOR COMPLETION ---
+        try:
+            job_status = wait_for_job_completion(auth_token, job_id)
+        except Exception as e:
+            log_api_error_to_status(conn, f"Upshop /job_status/{job_id}", e)
+            raise
 
         data_items = job_status.get("data", [])
         status("Download complete.", f"{len(data_items)} item(s)")
@@ -916,8 +778,22 @@ def run_import():
         if not data_items:
             totals["items_seen"] = 0
             status("No approved orders found.", "0 order / 0 item.")
+            try:
+                upsert_po_status(
+                    conn,
+                    f91="0",
+                    f27="0",
+                    step="Order Import",
+                    status_txt="SUCCESS",
+                    message="No approved orders found",
+                    dept=None,
+                    f1032=0,
+                )
+            except Exception:
+                pass
             return totals
 
+        # Build unique order list (by PO + Vendor)
         orders: Dict[Tuple[str, str], dict] = {}
         for it in data_items:
             f91, f27 = po_key(it)
@@ -925,6 +801,25 @@ def run_import():
                 continue
             if (f91, f27) not in orders:
                 orders[(f91, f27)] = it
+
+        # Init status per order (SUCCESS = “started”)
+        for (f91, f27), it in orders.items():
+            vendor_name = get_vendor_name_cached(conn, f27, vendor_cache)
+            dept_no = safe_int(it.get("department_number"), None)
+            try:
+                upsert_po_status(
+                    conn,
+                    f91=f91,
+                    f27=f27,
+                    step="Order Import",
+                    vendor_name=vendor_name,
+                    status_txt="SUCCESS",
+                    message="Import started (waiting final result)",
+                    dept=dept_no,
+                    f1032=0,
+                )
+            except Exception as e:
+                logging.exception(f"Failed to init PO status (F91={f91},F27={f27}): {e}")
 
         status("Inserting into SMS TMP tables...")
         seen_headers: Set[str] = set()
@@ -944,41 +839,111 @@ def run_import():
             if key not in po_first_dept and dept_no is not None:
                 po_first_dept[key] = int(dept_no)
 
+            vendor_name = get_vendor_name_cached(conn, vendor_no, vendor_cache)
             vendor_case_key = f"{vendor_no}{po}"
 
             status("Importing item...", f"{line_number}/{len(data_items)} | PO={po} | SKU={sku}")
 
             if vendor_case_key not in seen_headers:
-                inserted = send_rechdr(conn, item, vendor_cache)
-                totals["hdr_inserts"] += inserted if inserted else 0
-                seen_headers.add(vendor_case_key)
+                try:
+                    inserted = send_rechdr(conn, item, vendor_cache)
+                    totals["hdr_inserts"] += inserted if inserted else 0
+                    seen_headers.add(vendor_case_key)
 
-            inserted = send_recdtl(conn, item, line_number)
-            totals["dtl_inserts"] += inserted if inserted else 0
+                    upsert_po_status(
+                        conn,
+                        f91=f91,
+                        f27=f27,
+                        step="Order Import",
+                        vendor_name=vendor_name,
+                        status_txt="SUCCESS",
+                        message="Header inserted in TMP_REC_BAT",
+                        dept=dept_no,
+                        f1032=0,
+                    )
+                except Exception as e:
+                    totals["hdr_skipped"] += 1
+                    po_errors.add((f91, f27))
+                    logging.exception(f"Skipped TMP_REC_BAT for sku={sku}: {e}")
+                    ui_error("Skipped TMP_REC_BAT", f"PO={po} | SKU={sku} | {e}")
+
+                    upsert_po_status(
+                        conn,
+                        f91=f91,
+                        f27=f27,
+                        step="Order Import",
+                        vendor_name=vendor_name,
+                        status_txt="FAILED",
+                        message=f"Header insert failed: {e}",
+                        dept=dept_no,
+                        f1032=0,
+                    )
+
+            try:
+                inserted = send_recdtl(conn, item, line_number)
+                totals["dtl_inserts"] += inserted if inserted else 0
+            except Exception as e:
+                totals["dtl_skipped"] += 1
+                po_errors.add((f91, f27))
+                logging.exception(f"Skipped TMP_REC_DTL for sku={sku}: {e}")
+                ui_error("Skipped TMP_REC_DTL", f"PO={po} | line={line_number} | SKU={sku} | {e}")
+
+                upsert_po_status(
+                    conn,
+                    f91=f91,
+                    f27=f27,
+                    step="Order Import",
+                    vendor_name=vendor_name,
+                    status_txt="FAILED",
+                    message=f"Detail insert failed (line={line_number}, sku={sku}): {e}",
+                    dept=dept_no,
+                    f1032=0,
+                )
 
             line_number += 1
 
-        for (f91, f27) in orders.keys():
-            if (f91, f27) in po_errors:
-                continue
-
-            dept_f03 = po_first_dept.get((f91, f27))
-            if dept_f03 is None:
-                continue
-
+        for (f91, f27), it in orders.items():
+            vendor_name = get_vendor_name_cached(conn, f27, vendor_cache)
+            dept_no = safe_int(it.get("department_number"), None)
             try:
-                send_success_email_for_po(
-                    conn=conn,
-                    cfg_path=CONFIG_PATH,
-                    po_number=f91,
-                    vendor_number=f27,
-                    dept_f03=int(dept_f03),
+                upsert_po_status(
+                    conn,
+                    f91=f91,
+                    f27=f27,
+                    step="Order Import",
+                    vendor_name=vendor_name,
+                    status_txt="SUCCESS",
+                    message="Imported in TMP tables (waiting DBGEN in CGI)",
+                    dept=dept_no,
+                    f1032=0,
                 )
-            except Exception as e:
-                logging.exception(f"Email notification failed for PO={f91} vendor={f27}: {e}")
+            except Exception:
+                pass
+
+        if totals["hdr_skipped"] or totals["dtl_skipped"]:
+            ui_warn(
+                "Import finished with skipped rows",
+                f"hdr_skipped={totals['hdr_skipped']} | dtl_skipped={totals['dtl_skipped']}",
+            )
+
+        # NEW: list PO imported successfully (those that are NOT in po_errors)
+        imported_ok: List[str] = []
+        for (f91, f27) in orders.keys():
+            if (f91, f27) not in po_errors:
+                imported_ok.append(f91)
+
+        totals["po_imported_ok"] = sorted(set(imported_ok))
 
         status("Import completed.", f"PO(s)={len(orders)} | Items={totals['items_seen']}")
         return totals
+
+    except Exception as e:
+        logging.exception(f"Import failed in run_import(): {e}")
+        try:
+            log_api_error_to_status(conn, "RUN FAILED", e)
+        except Exception:
+            pass
+        raise
 
     finally:
         if conn is not None:
@@ -987,6 +952,22 @@ def run_import():
                 status("SQL connection closed.")
             except Exception:
                 logging.exception("Error closing SQL connection.")
+
+        logging.info(
+            "Run summary: "
+            f"items_seen={totals['items_seen']}, "
+            f"hdr_inserts={totals['hdr_inserts']}, hdr_skipped={totals['hdr_skipped']}, "
+            f"dtl_inserts={totals['dtl_inserts']}, dtl_skipped={totals['dtl_skipped']}"
+        )
+
+        orders_imported = totals["hdr_inserts"]
+        if orders_imported > 0:
+            status(
+                f"{orders_imported} order{'s' if orders_imported > 1 else ''} were imported",
+                "You can close this window",
+            )
+        else:
+            status("No orders were imported", "You can close this window")
 
         logging.info("=== End run ===")
 
@@ -1008,6 +989,7 @@ def main():
 
             orders_imported = totals.get("hdr_inserts", 0)
             items_seen = totals.get("items_seen", 0)
+            po_ok = totals.get("po_imported_ok", [])
 
             if items_seen == 0:
                 title = "No approved orders"
@@ -1021,6 +1003,26 @@ def main():
 
             def on_done():
                 ui.done(title, detail)
+
+                # NEW: show imported PO numbers in the listbox (requires ui_status.py add_message())
+                try:
+                    if po_ok:
+                        max_show = 40
+                        shown = po_ok[:max_show]
+                        remaining = len(po_ok) - len(shown)
+
+                        ui.add_message("INFO", "PO imported successfully", f"Count={len(po_ok)}")
+                        for po in shown:
+                            ui.add_message("INFO", "Imported PO", str(po))
+
+                        if remaining > 0:
+                            ui.add_message("INFO", "Imported PO", f"... (+{remaining} more)")
+                    else:
+                        ui.add_message("INFO", "No successful PO", "None")
+                except Exception as _:
+                    # If ui_status.py wasn't updated yet, don't crash the UI.
+                    pass
+
                 start_auto_close_countdown(ui, AUTO_CLOSE_SECONDS)
 
             ui.root.after(0, on_done)
