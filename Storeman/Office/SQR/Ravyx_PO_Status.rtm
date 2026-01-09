@@ -127,10 +127,10 @@ object ppReport1: TppReport
       Font.Size = 9
       Font.Style = [fsBold]
       Transparent = True
-      mmHeight = 3701
-      mmLeft = 64001
-      mmTop = 27000
-      mmWidth = 17000
+      mmHeight = 3704
+      mmLeft = 67998
+      mmTop = 26988
+      mmWidth = 16933
       BandType = 0
     end
     object ppHdrCol5: TppLabel
@@ -234,7 +234,7 @@ object ppReport1: TppReport
       mmHeight = 3598
       mmLeft = 28000
       mmTop = 0
-      mmWidth = 1778
+      mmWidth = 10668
       BandType = 4
     end
     object ppDBTextPO: TppDBText
@@ -248,11 +248,12 @@ object ppReport1: TppReport
       Font.Size = 9
       Font.Style = []
       Transparent = True
+      WordWrap = True
       DataPipelineName = 'MASTER'
       mmHeight = 3598
-      mmLeft = 42000
+      mmLeft = 40746
       mmTop = 0
-      mmWidth = 1778
+      mmWidth = 7112
       BandType = 4
     end
     object ppDBTextVendor: TppDBText
@@ -268,9 +269,9 @@ object ppReport1: TppReport
       Transparent = True
       DataPipelineName = 'MASTER'
       mmHeight = 3598
-      mmLeft = 64000
+      mmLeft = 67733
       mmTop = 0
-      mmWidth = 1778
+      mmWidth = 8636
       BandType = 4
     end
     object ppDBTextVendName: TppDBText
@@ -284,11 +285,12 @@ object ppReport1: TppReport
       Font.Size = 8
       Font.Style = []
       Transparent = True
+      WordWrap = True
       DataPipelineName = 'MASTER'
-      mmHeight = 3979
+      mmHeight = 6519
       mmLeft = 85990
       mmTop = 0
-      mmWidth = 26712
+      mmWidth = 25019
       BandType = 4
     end
     object ppDBTextStatus: TppDBText
@@ -306,7 +308,7 @@ object ppReport1: TppReport
       mmHeight = 2879
       mmLeft = 123081
       mmTop = 0
-      mmWidth = 8424
+      mmWidth = 11938
       BandType = 4
     end
     object ppDBTextDept: TppDBText
@@ -321,10 +323,10 @@ object ppReport1: TppReport
       Font.Style = []
       Transparent = True
       DataPipelineName = 'MASTER'
-      mmHeight = 4022
+      mmHeight = 3598
       mmLeft = 140541
       mmTop = 0
-      mmWidth = 8001
+      mmWidth = 3556
       BandType = 4
     end
     object ppDBTextMsg: TppDBText
@@ -337,6 +339,7 @@ object ppReport1: TppReport
       Font.Size = 6
       Font.Style = []
       Transparent = True
+      WordWrap = True
       DataPipelineName = 'MASTER'
       mmHeight = 4022
       mmLeft = 152000

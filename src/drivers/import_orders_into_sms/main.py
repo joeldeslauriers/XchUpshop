@@ -1,4 +1,12 @@
-# main.py (import_orders_into_sms)
+# main.py (import_orders_into_sms) - corrected
+#
+# Fixes included:
+# 1) If DB config missing (DatabaseName empty) -> clear UX + STOP (NO API call).
+# 2) If DB connection fails -> clear UX + STOP normal flow (no purge SQL tables, no API call).
+# 3) Validate required DB objects (TMP_REC_BAT/TMP_REC_DTL/VENDOR_TAB/RAVYX_PO_STATUS) BEFORE any Upshop export (prevents consuming PO).
+# 4) Purge RAVYX_PO_STATUS is skipped with friendly message if table not accessible.
+# 5) Avoid writing RUN FAILED row to RAVYX_PO_STATUS when DB isn't usable.
+# 6) Avoid misleading status in finally when DB never opened.
 
 import os
 import sys
@@ -16,11 +24,6 @@ import requests
 import pyodbc
 from requests.exceptions import HTTPError, Timeout, RequestException
 
-# =============================================================================
-# IMPORTANT: shared is a PACKAGE now:
-#   src/shared/__init__.py
-#   src/shared/http_errors.py
-# =============================================================================
 from shared.http_errors import HTTP_ERROR_MESSAGES
 
 # =============================================================================
@@ -31,9 +34,7 @@ IS_FROZEN = getattr(sys, "frozen", False)
 BASE_DIR = os.path.dirname(sys.executable) if IS_FROZEN else os.path.dirname(os.path.abspath(__file__))
 
 # =============================================================================
-# RUN ID (NEW)
-# Each execution gets a unique "global" key so RUN FAILED / API errors do NOT overwrite previous runs.
-# Stored in F91 for global/system rows; F27 stays "0".
+# RUN ID
 # =============================================================================
 
 RUN_ID = datetime.now().strftime("%y%m%d%H%M%S")  # <= 12 chars, safe for F91 (20)
@@ -56,7 +57,6 @@ ui_queue = Queue()
 # =============================================================================
 
 def get_config_path() -> str:
-    # config.ini must be next to the EXE or the script
     return os.path.join(BASE_DIR, "config.ini")
 
 # =============================================================================
@@ -69,7 +69,6 @@ def read_debugscreen(config_path: str) -> bool:
 
     raw = cfg.get("Settings", "DebugScreen", fallback="0")
     raw = (raw or "").strip()
-
     if raw == "":
         return False
 
@@ -104,7 +103,6 @@ def ensure_console():
         return
 
     kernel32 = ctypes.windll.kernel32
-
     if kernel32.GetConsoleWindow():
         return
 
@@ -272,14 +270,15 @@ logging.info(f"RUN_ID={RUN_ID}")
 # CONFIG VALUES
 # =============================================================================
 
-server_name = config["Settings"]["ServerName"]
-database_name = config["Settings"]["DatabaseName"]
-sql_driver = config["Settings"]["SQLDriver"]
-store_number = int(config["Settings"]["StoreNumber"])
+server_name = (config.get("Settings", "ServerName", fallback="") or "").strip()
+database_name = (config.get("Settings", "DatabaseName", fallback="") or "").strip()
+sql_driver = (config.get("Settings", "SQLDriver", fallback="") or "").strip()
 
-base_url = config["ImportOrders"]["BaseUrl"].rstrip("/")
-api_username = config["ImportOrders"]["Username"]
-api_password = config["ImportOrders"]["Password"]
+store_number = int((config.get("Settings", "StoreNumber", fallback="0") or "0").strip() or 0)
+
+base_url = (config.get("ImportOrders", "BaseUrl", fallback="") or "").strip().rstrip("/")
+api_username = (config.get("ImportOrders", "Username", fallback="") or "").strip()
+api_password = (config.get("ImportOrders", "Password", fallback="") or "").strip()
 
 LOG_PURGE_DAYS = _get_cfg_int(config, "Settings", "LogPurge", 0)
 REPORT_PURGE_DAYS = _get_cfg_int(config, "Settings", "ReportPurge", 0)
@@ -338,28 +337,59 @@ def purge_ravyx_po_status(conn, keep_days: int) -> int:
         return 0
 
     cutoff = datetime.now() - timedelta(days=keep_days)
-    status("Report purge started", f"keep_days={keep_days} | cutoff<{cutoff.strftime('%Y-%m-%d %H:%M:%S')}>")
 
     cur = conn.cursor()
     try:
+        # Table access check
+        cur.execute("SELECT OBJECT_ID('dbo.RAVYX_PO_STATUS','U')")
+        obj_id = cur.fetchone()
+        obj_id = obj_id[0] if obj_id else None
+
+        if obj_id is None:
+            ui_warn(
+                "PO Status table not accessible",
+                "Purge skipped. Verify DatabaseName / schema (dbo) / permissions."
+            )
+            logging.warning("Purge skipped: dbo.RAVYX_PO_STATUS not accessible in current database.")
+            return 0
+
+        status("Report purge started", f"keep_days={keep_days} | cutoff<{cutoff.strftime('%Y-%m-%d %H:%M:%S')}>")
         cur.execute("DELETE FROM dbo.RAVYX_PO_STATUS WHERE F254 < ?", cutoff)
+
         deleted = cur.rowcount if cur.rowcount is not None else 0
         conn.commit()
         status("Report purge finished", f"deleted={deleted}")
         return deleted
-    except Exception as e:
+
+    except pyodbc.Error as e:
+        sqlstate = ""
+        try:
+            sqlstate = e.args[0] if e.args else ""
+        except Exception:
+            pass
+
+        if "42S02" in str(sqlstate) or "Invalid object name" in str(e):
+            ui_warn(
+                "PO Status purge skipped",
+                "Table not accessible in this database. Verify DatabaseName / schema / permissions."
+            )
+            logging.warning(f"Purge skipped (table not accessible): {e}")
+            return 0
+
+        ui_warn("PO Status purge failed", "Database error while purging. Check logs.")
         logging.exception(f"Report purge failed: {e}")
-        ui_warn("Report purge failed", str(e))
         try:
             conn.rollback()
         except Exception:
             pass
         return 0
+
     finally:
         try:
             cur.close()
         except Exception:
             pass
+
 
 # =============================================================================
 # SQL HELPERS
@@ -375,13 +405,57 @@ def _get_sql_connection():
 
 def open_and_validate_database_connection():
     status("Validating database connectivity...")
-    conn = _get_sql_connection()
+    try:
+        conn = _get_sql_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        status("Database connectivity validated.")
+        return conn
+    except Exception as e:
+        logging.exception("Database connection failed")
+        ui_error(
+            "Database connection failed",
+            "Database is not accessible. No orders were processed. Please verify database configuration or contact IT."
+        )
+        raise RuntimeError("DB_CONNECTION_FAILED") from e
+
+
+def validate_required_db_objects(conn) -> None:
+    """
+    Hard-stop BEFORE calling Upshop export.
+    Prevents consuming/acknowledging POs when DB isn't ready.
+    """
+    required = [
+        "dbo.TMP_REC_BAT",
+        "dbo.TMP_REC_DTL",
+        "dbo.VENDOR_TAB",
+        "dbo.RAVYX_PO_STATUS",
+    ]
+
     cur = conn.cursor()
-    cur.execute("SELECT 1")
-    cur.fetchone()
-    cur.close()
-    status("Database connectivity validated.")
-    return conn
+    try:
+        missing: List[str] = []
+        for obj in required:
+            cur.execute("SELECT OBJECT_ID(?, 'U')", obj)
+            row = cur.fetchone()
+            oid = row[0] if row else None
+            if oid is None:
+                missing.append(obj)
+
+        if missing:
+            ui_error(
+                "Database not ready",
+                "Missing/Not accessible: " + ", ".join(missing) +
+                ". No API call was made. Verify DatabaseName / schema (dbo) / permissions."
+            )
+            raise RuntimeError("DB_SCHEMA_NOT_READY")
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
 
 
 def safe_int(v, default=0):
@@ -425,17 +499,12 @@ def upsert_po_status(
     dept: Optional[int] = None,
     f1032: int = 0,
 ):
-    """
-    Writes one row per (F91,F27). For "global/system" messages we now use (RUN_ID,"0")
-    so each run keeps history instead of overwriting the previous run.
-    """
     f91 = _clip(f91, 20)
     f27 = _clip(f27, 14)
     step = _clip(step, 40)
     vendor_name = _clip(vendor_name, 60)
     status_txt = _clip(status_txt, 60)
 
-    # Keep F1081 NULL on SUCCESS (your current table shows NULL)
     message_db = None if (status_txt or "").strip().upper() == "SUCCESS" else _clip(message, 5000)
     now = datetime.now()
 
@@ -462,24 +531,10 @@ def upsert_po_status(
     """
 
     params = (
-        f91,         # S.F91
-        f27,         # S.F27
-        now,         # update: F254
-        step,        # update: F02
-        status_txt,  # update: F29
-        message_db,  # update: F1081
-        vendor_name, # update: F334
-        dept_i,      # update: F03
-        f1032_i,     # update: F1032 (if empty)
-        f1032_i,     # insert: F1032
-        f91,         # insert: F91
-        step,        # insert: F02
-        f27,         # insert: F27
-        vendor_name, # insert: F334
-        now,         # insert: F254
-        status_txt,  # insert: F29
-        message_db,  # insert: F1081
-        dept_i,      # insert: F03
+        f91, f27,
+        now, step, status_txt, message_db, vendor_name,
+        dept_i, f1032_i,
+        f1032_i, f91, step, f27, vendor_name, now, status_txt, message_db, dept_i
     )
 
     cur.execute(sql, params)
@@ -488,9 +543,6 @@ def upsert_po_status(
 
 
 def log_api_error_to_status(conn, endpoint: str, exc: Exception):
-    """
-    Writes API errors to RAVYX_PO_STATUS (global/system row for THIS run: F91=RUN_ID, F27='0').
-    """
     if conn is None:
         return
     try:
@@ -562,8 +614,7 @@ def wait_for_job_completion(auth_token, job_id, poll_interval_seconds=5, timeout
             ui_error("Upshop job failed", f"status={status_raw} | message={message}")
             raise RuntimeError(f"Job failed with status={status_raw}. message={message}")
 
-        elapsed = time.time() - start
-        if elapsed > timeout_seconds:
+        if (time.time() - start) > timeout_seconds:
             ui_error("Upshop job timeout", f"Last status={status_raw} | waited={timeout_seconds}s")
             raise TimeoutError(f"Job did not finish within {timeout_seconds}s. Last status={status_raw}")
 
@@ -575,7 +626,6 @@ def wait_for_job_completion(auth_token, job_id, poll_interval_seconds=5, timeout
 
 def get_vendor_name_cached(conn, vendor_number, vendor_cache: Dict[str, str]) -> str:
     key = safe_str(vendor_number)
-
     if key in vendor_cache:
         return vendor_cache[key]
 
@@ -613,34 +663,19 @@ def send_rechdr(conn, job_data_entry, vendor_cache: Dict[str, str]):
     query = """
         INSERT INTO [dbo].[TMP_REC_BAT] (
             [F1032], [F27], [F76], [F91], [F253], [F254], [F334], [F352], [F1035], [F1036],
-            [F1056], [F1057], [F1067], [F1068], [F1101], [F1126], [F1127], [F1246], [F1653]
-        ) VALUES (
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-        )
+            [F1056], [F1057], [F1067], [F1068], [F1101], [F1126], [F902], [F1246], [F1653]
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
 
     store_number_string = "00" + str(store_number_local)
 
     values = (
-        sms_order_number,            # F1032
-        vendor_number,               # F27
-        approval_date,               # F76
-        case_order_number,           # F91
-        approval_date,               # F253
-        effective_date,              # F254
-        vendor_name,                 # F334
-        88454,                       # F352
-        121609,                      # F1035
-        121609,                      # F1036
-        store_number_string,         # F1056
-        "901",                       # F1057
-        "OPEN",                      # F1067
-        "ORDER",                     # F1068
-        1,                           # F1101
-        757,                         # F1126
-        "Upshop Order",              # F1127
-        effective_date,              # F1246
-        effective_date,              # F1653
+        sms_order_number, vendor_number, approval_date, case_order_number,
+        approval_date, effective_date, vendor_name,
+        88454, 121609, 121609,
+        store_number_string, "901",
+        "OPEN", "ORDER", 1, 757, "UPSHOP",
+        effective_date, effective_date
     )
 
     cursor.execute(query, values)
@@ -671,18 +706,10 @@ def send_recdtl(conn, job_data_entry, line_num):
     """
 
     insert_values = (
-        case_order_number,           # F1032
-        safe_int(line_num),          # F1101
-        sku,                         # F01
-        department_number,           # F03
-        float(order_quantity),       # F1003
-        description,                 # F1041
-        3510,                        # F1063
-        "ITEM",                      # F1067
-        "CASE",                      # F1184
-        "C",                         # F1887
-        float(order_quantity),       # F75
-        approval_date,               # F76
+        case_order_number, safe_int(line_num), sku, department_number,
+        float(order_quantity), description,
+        3510, "ITEM", "CASE", "C",
+        float(order_quantity), approval_date
     )
 
     cursor.execute(insert_query, insert_values)
@@ -702,55 +729,54 @@ def run_import():
         "items_seen": 0,
         "hdr_skipped": 0,
         "dtl_skipped": 0,
-        "po_imported_ok": [],  # list of PO imported successfully
+        "po_imported_ok": [],
     }
 
     conn = None
     vendor_cache: Dict[str, str] = {}
-
     po_errors: Set[Tuple[str, str]] = set()
-    po_first_dept: Dict[Tuple[str, str], int] = {}
+
+    db_connected = False
 
     try:
+        # Log folder purge is local only -> OK even if DB is down
         upshop_log_dir = os.path.join(BASE_DIR, "log")
         purge_log_files(upshop_log_dir, LOG_PURGE_DAYS)
 
+        # --- HARD STOP: DB config missing -> NO API call ---
+        if not database_name:
+            ui_error(
+                "Import aborted",
+                "DatabaseName is empty in config.ini.\nNo API call was made.\nPlease fix DB config and retry."
+            )
+            raise RuntimeError("DB_CONFIG_MISSING")
+
         status("Opening database connection...")
         conn = open_and_validate_database_connection()
+        db_connected = True
 
+        # --- HARD STOP: DB schema not ready -> NO API call ---
+        validate_required_db_objects(conn)
+
+        # Purge is optional; keep friendly if table isn't accessible
         purge_ravyx_po_status(conn, REPORT_PURGE_DAYS)
 
+        # ============ ONLY NOW we touch Upshop API ============
         status("Connecting to Upshop API...", "Requesting auth token")
         urlt = f"{base_url}/login"
         payloadt = {"username": api_username, "password": api_password}
         headerst = {"Content-Type": "application/json"}
 
         # --- LOGIN ---
-        try:
-            response_data = request_json(
-                "post", urlt, headers=headerst, json_body=payloadt, timeout=90, context="Upshop /login"
-            )
-        except Exception as e:
-            title, detail = explain_http_exception(e, "Upshop /login")
-            try:
-                upsert_po_status(
-                    conn,
-                    f91=RUN_ID,
-                    f27="0",
-                    step="Upshop /login",
-                    status_txt="FAILED",
-                    message=f"{title} | {detail}",
-                    dept=None,
-                    f1032=0,
-                )
-            except Exception:
-                pass
-            raise
+        response_data = request_json(
+            "post", urlt, headers=headerst, json_body=payloadt, timeout=90, context="Upshop /login"
+        )
 
         auth_token = response_data.get("access_token")
         if not auth_token:
             msg = "Upshop /login response has no access_token"
             ui_error("Auth token missing", msg)
+            # DB is up here, so it's safe to attempt status table write
             try:
                 upsert_po_status(
                     conn,
@@ -769,18 +795,10 @@ def run_import():
         status("Auth token retrieved.")
 
         # --- CREATE EXPORT JOB ---
-        try:
-            job_id = get_job_id(auth_token)
-        except Exception as e:
-            log_api_error_to_status(conn, "Upshop /export/orders", e)
-            raise
+        job_id = get_job_id(auth_token)
 
         # --- WAIT FOR COMPLETION ---
-        try:
-            job_status = wait_for_job_completion(auth_token, job_id)
-        except Exception as e:
-            log_api_error_to_status(conn, f"Upshop /job_status/{job_id}", e)
-            raise
+        job_status = wait_for_job_completion(auth_token, job_id)
 
         data_items = job_status.get("data", [])
         status("Download complete.", f"{len(data_items)} item(s)")
@@ -812,25 +830,6 @@ def run_import():
             if (f91, f27) not in orders:
                 orders[(f91, f27)] = it
 
-        # Init status per order (SUCCESS = “started”)
-        for (f91, f27), it in orders.items():
-            vendor_name = get_vendor_name_cached(conn, f27, vendor_cache)
-            dept_no = safe_int(it.get("department_number"), None)
-            try:
-                upsert_po_status(
-                    conn,
-                    f91=f91,
-                    f27=f27,
-                    step="Order Import",
-                    vendor_name=vendor_name,
-                    status_txt="SUCCESS",
-                    message="Import started (waiting final result)",
-                    dept=dept_no,
-                    f1032=0,
-                )
-            except Exception as e:
-                logging.exception(f"Failed to init PO status (F91={f91},F27={f27}): {e}")
-
         status("Inserting into SMS TMP tables...")
         seen_headers: Set[str] = set()
         line_number = 1
@@ -845,10 +844,6 @@ def run_import():
             f91 = _clip(po, 20)
             f27 = _clip(vendor_no, 14)
 
-            key = (f91, f27)
-            if key not in po_first_dept and dept_no is not None:
-                po_first_dept[key] = int(dept_no)
-
             vendor_name = get_vendor_name_cached(conn, vendor_no, vendor_cache)
             vendor_case_key = f"{vendor_no}{po}"
 
@@ -860,34 +855,41 @@ def run_import():
                     totals["hdr_inserts"] += inserted if inserted else 0
                     seen_headers.add(vendor_case_key)
 
-                    upsert_po_status(
-                        conn,
-                        f91=f91,
-                        f27=f27,
-                        step="Order Import",
-                        vendor_name=vendor_name,
-                        status_txt="SUCCESS",
-                        message="Header inserted in TMP_REC_BAT",
-                        dept=dept_no,
-                        f1032=0,
-                    )
+                    try:
+                        upsert_po_status(
+                            conn,
+                            f91=f91,
+                            f27=f27,
+                            step="Order Import",
+                            vendor_name=vendor_name,
+                            status_txt="SUCCESS",
+                            message="Header inserted in TMP_REC_BAT",
+                            dept=dept_no,
+                            f1032=0,
+                        )
+                    except Exception:
+                        pass
+
                 except Exception as e:
                     totals["hdr_skipped"] += 1
                     po_errors.add((f91, f27))
                     logging.exception(f"Skipped TMP_REC_BAT for sku={sku}: {e}")
                     ui_error("Skipped TMP_REC_BAT", f"PO={po} | SKU={sku} | {e}")
 
-                    upsert_po_status(
-                        conn,
-                        f91=f91,
-                        f27=f27,
-                        step="Order Import",
-                        vendor_name=vendor_name,
-                        status_txt="FAILED",
-                        message=f"Header insert failed: {e}",
-                        dept=dept_no,
-                        f1032=0,
-                    )
+                    try:
+                        upsert_po_status(
+                            conn,
+                            f91=f91,
+                            f27=f27,
+                            step="Order Import",
+                            vendor_name=vendor_name,
+                            status_txt="FAILED",
+                            message=f"Header insert failed: {e}",
+                            dept=dept_no,
+                            f1032=0,
+                        )
+                    except Exception:
+                        pass
 
             try:
                 inserted = send_recdtl(conn, item, line_number)
@@ -898,77 +900,53 @@ def run_import():
                 logging.exception(f"Skipped TMP_REC_DTL for sku={sku}: {e}")
                 ui_error("Skipped TMP_REC_DTL", f"PO={po} | line={line_number} | SKU={sku} | {e}")
 
-                upsert_po_status(
-                    conn,
-                    f91=f91,
-                    f27=f27,
-                    step="Order Import",
-                    vendor_name=vendor_name,
-                    status_txt="FAILED",
-                    message=f"Detail insert failed (line={line_number}, sku={sku}): {e}",
-                    dept=dept_no,
-                    f1032=0,
-                )
+                try:
+                    upsert_po_status(
+                        conn,
+                        f91=f91,
+                        f27=f27,
+                        step="Order Import",
+                        vendor_name=vendor_name,
+                        status_txt="FAILED",
+                        message=f"Detail insert failed (line={line_number}, sku={sku}): {e}",
+                        dept=dept_no,
+                        f1032=0,
+                    )
+                except Exception:
+                    pass
 
             line_number += 1
 
-        # Final per-order message: success or partial failure
-        for (f91, f27), it in orders.items():
-            vendor_name = get_vendor_name_cached(conn, f27, vendor_cache)
-            dept_no = safe_int(it.get("department_number"), None)
-
-            if (f91, f27) in po_errors:
-                final_status = "FAILED"
-                final_msg = "Imported with errors (some rows skipped)"
-            else:
-                final_status = "SUCCESS"
-                final_msg = "Imported in TMP tables (waiting DBGEN in CGI)"
-
-            try:
-                upsert_po_status(
-                    conn,
-                    f91=f91,
-                    f27=f27,
-                    step="Order Import",
-                    vendor_name=vendor_name,
-                    status_txt=final_status,
-                    message=final_msg,
-                    dept=dept_no,
-                    f1032=0,
-                )
-            except Exception:
-                pass
-
-        if totals["hdr_skipped"] or totals["dtl_skipped"]:
-            ui_warn(
-                "Import finished with skipped rows",
-                f"hdr_skipped={totals['hdr_skipped']} | dtl_skipped={totals['dtl_skipped']}",
-            )
-
-        # List PO imported successfully (those that are NOT in po_errors)
         imported_ok: List[str] = []
-        for (f91, f27) in orders.keys():
-            if (f91, f27) not in po_errors:
-                imported_ok.append(f91)
+        for (f91_k, f27_k) in orders.keys():
+            if (f91_k, f27_k) not in po_errors:
+                imported_ok.append(f91_k)
 
         totals["po_imported_ok"] = sorted(set(imported_ok))
-
         status("Import completed.", f"PO(s)={len(orders)} | Items={totals['items_seen']}")
         return totals
 
     except Exception as e:
         logging.exception(f"Import failed in run_import(): {e}")
+
+        # DB config/connection/schema issues: do NOT try to write to RAVYX_PO_STATUS
+        if any(tag in str(e) for tag in ("DB_CONFIG_MISSING", "DB_CONNECTION_FAILED", "DB_SCHEMA_NOT_READY")):
+            raise
+
+        # Other errors, DB is likely up -> try to log in status table
         try:
             log_api_error_to_status(conn, "RUN FAILED", e)
         except Exception:
             pass
+
         raise
 
     finally:
         if conn is not None:
             try:
                 conn.close()
-                status("SQL connection closed.")
+                if db_connected:
+                    status("SQL connection closed.")
             except Exception:
                 logging.exception("Error closing SQL connection.")
 
@@ -978,16 +956,6 @@ def run_import():
             f"hdr_inserts={totals['hdr_inserts']}, hdr_skipped={totals['hdr_skipped']}, "
             f"dtl_inserts={totals['dtl_inserts']}, dtl_skipped={totals['dtl_skipped']}"
         )
-
-        orders_imported = totals["hdr_inserts"]
-        if orders_imported > 0:
-            status(
-                f"{orders_imported} order{'s' if orders_imported > 1 else ''} were imported",
-                "You can close this window",
-            )
-        else:
-            status("No orders were imported", "You can close this window")
-
         logging.info("=== End run ===")
 
 # =============================================================================
@@ -1023,21 +991,21 @@ def main():
             def on_done():
                 ui.done(title, detail)
 
-                # Show imported PO numbers in the listbox (requires ui_status.py to have add_message())
                 try:
-                    if po_ok:
-                        max_show = 40
-                        shown = po_ok[:max_show]
-                        remaining = len(po_ok) - len(shown)
+                    if hasattr(ui, "add_message"):
+                        if po_ok:
+                            max_show = 40
+                            shown = po_ok[:max_show]
+                            remaining = len(po_ok) - len(shown)
 
-                        ui.add_message("INFO", "PO imported successfully", f"Count={len(po_ok)}")
-                        for po in shown:
-                            ui.add_message("INFO", "Imported PO", str(po))
+                            ui.add_message("INFO", "PO imported successfully", f"Count={len(po_ok)}")
+                            for po in shown:
+                                ui.add_message("INFO", "Imported PO", str(po))
 
-                        if remaining > 0:
-                            ui.add_message("INFO", "Imported PO", f"... (+{remaining} more)")
-                    else:
-                        ui.add_message("INFO", "No successful PO", "None")
+                            if remaining > 0:
+                                ui.add_message("INFO", "Imported PO", f"... (+{remaining} more)")
+                        else:
+                            ui.add_message("INFO", "No successful PO", "None")
                 except Exception:
                     pass
 
@@ -1049,7 +1017,26 @@ def main():
             logging.exception(f"Import failed: {e}")
 
             def on_err():
-                ui.error("Import failed", str(e))
+                s = str(e)
+
+                if "DB_CONFIG_MISSING" in s:
+                    ui.error(
+                        "Import aborted",
+                        "DatabaseName is empty in config.ini.\nNo API call was made.\nPlease fix DB config and retry."
+                    )
+                elif "DB_CONNECTION_FAILED" in s:
+                    ui.error(
+                        "Import aborted",
+                        "Database is not accessible.\nNo API call was made.\nPlease verify DB connection/config or contact IT."
+                    )
+                elif "DB_SCHEMA_NOT_READY" in s:
+                    ui.error(
+                        "Import aborted",
+                        "Database is not ready (missing tables or permissions).\nNo API call was made.\nVerify schema/permissions."
+                    )
+                else:
+                    ui.error("Import failed", str(e))
+
                 start_auto_close_countdown(ui, AUTO_CLOSE_SECONDS)
 
             ui.root.after(0, on_err)

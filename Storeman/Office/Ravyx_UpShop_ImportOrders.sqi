@@ -19,3 +19,5 @@
 @dbTable(Q1,SELECT COUNT(*) AS F01 FROM REC_BAT WHERE F1032 IS NOT NULL);
 
 @FMT(CMP,@dbRow(Q1,F01,#)=0,'@FMT(CHR,27)','®EXEC(FCT=3211)');
+
+@EXEC(SQL=Ravyx_send_email_rec);
