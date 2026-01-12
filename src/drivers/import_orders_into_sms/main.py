@@ -776,7 +776,7 @@ def run_import():
         if not auth_token:
             msg = "Upshop /login response has no access_token"
             ui_error("Auth token missing", msg)
-            # DB is up here, so it's safe to attempt status table write
+           
             try:
                 upsert_po_status(
                     conn,
