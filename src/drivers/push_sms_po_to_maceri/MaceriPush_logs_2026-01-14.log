@@ -1,0 +1,11 @@
+[10:01:38] INFO: === Start run (MaceriPush) ===
+[10:01:38] INFO: AppVersion=VSVersionInfo( | Frozen=False | BaseDir=C:\XchUpshop\src\drivers\push_sms_po_to_maceri
+[10:01:38] INFO: ConfigPath=C:\XchUpshop\src\drivers\push_sms_po_to_maceri\config.ini
+[10:03:00] INFO: === Start run (MaceriPush) ===
+[10:03:00] INFO: AppVersion=VSVersionInfo( | Frozen=False | BaseDir=C:\XchUpshop\src\drivers\push_sms_po_to_maceri
+[10:03:00] INFO: ConfigPath=C:\XchUpshop\src\drivers\push_sms_po_to_maceri\config.ini
+[10:03:18] ERROR: Fatal error: ('08001', "[08001] [Microsoft][ODBC SQL Server Driver][DBNETLIB]SQL Server n'existe pas ou son accès est refusé. (17) (SQLDriverConnect); [08001] [Microsoft][ODBC SQL Server Driver][DBNETLIB]ConnectionOpen (Connect()). (53)")
+Traceback (most recent call last):
+  File "C:\XchUpshop\src\drivers\push_sms_po_to_maceri\main.py", line 380, in worker
+    conn = pyodbc.connect(connection_string)
+pyodbc.OperationalError: ('08001', "[08001] [Microsoft][ODBC SQL Server Driver][DBNETLIB]SQL Server n'existe pas ou son accès est refusé. (17) (SQLDriverConnect); [08001] [Microsoft][ODBC SQL Server Driver][DBNETLIB]ConnectionOpen (Connect()). (53)")

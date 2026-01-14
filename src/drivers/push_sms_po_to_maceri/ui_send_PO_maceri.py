@@ -11,14 +11,14 @@ class VendorSendUI:
       - (msg, detail)                         # legacy
       - (level, msg, detail)                  # new, level in {"INFO","WARN","ERROR","DONE"}
 
-    Behavior:
-      - INFO/WARN/ERROR are appended to the Messages list (so you see SUCCESS lines)
-      - DONE stops progress and enables Close
-      - ERROR stops progress and enables Close immediately
+    Auto close:
+      - starts countdown on DONE or ERROR (success OR error)
     """
 
-    def __init__(self, title="Send PO to Vendor", queue=None):
+    def __init__(self, title="Send PO to Vendor", queue=None, auto_close_seconds: int = 0):
         self.queue = queue
+        self.auto_close_seconds = int(auto_close_seconds or 0)
+
         self.root = tk.Tk()
         self.root.title(title)
 
@@ -35,13 +35,17 @@ class VendorSendUI:
         self.errors_count = 0
         self.warn_count = 0
 
+        # countdown state
+        self._countdown_remaining = 0
+        self._countdown_job = None
+
         # ===== Root grid config
-        self.root.grid_rowconfigure(0, weight=0)  # title
-        self.root.grid_rowconfigure(1, weight=0)  # msg
-        self.root.grid_rowconfigure(2, weight=0)  # detail
-        self.root.grid_rowconfigure(3, weight=0)  # progress
-        self.root.grid_rowconfigure(4, weight=1)  # messages area expands
-        self.root.grid_rowconfigure(5, weight=0)  # buttons
+        self.root.grid_rowconfigure(0, weight=0)
+        self.root.grid_rowconfigure(1, weight=0)
+        self.root.grid_rowconfigure(2, weight=0)
+        self.root.grid_rowconfigure(3, weight=0)
+        self.root.grid_rowconfigure(4, weight=1)
+        self.root.grid_rowconfigure(5, weight=0)
         self.root.grid_columnconfigure(0, weight=1)
 
         # ===== Header
@@ -73,6 +77,7 @@ class VendorSendUI:
         header = ttk.Frame(frame)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 4))
         header.grid_columnconfigure(0, weight=1)
+        header.grid_columnconfigure(1, weight=1)
 
         ttk.Label(header, text="Messages:", font=("Segoe UI", 9, "bold")).grid(
             row=0, column=0, sticky="w"
@@ -128,9 +133,10 @@ class VendorSendUI:
         self._refresh_counts()
 
     def _refresh_counts(self):
-        self.count_var.set(
-            f"Success: {self.success_count} | Errors: {self.errors_count} | Warnings: {self.warn_count}"
-        )
+        base = f"Success: {self.success_count} | Errors: {self.errors_count} | Warnings: {self.warn_count}"
+        if self._countdown_remaining > 0:
+            base += f" | Auto-close in {self._countdown_remaining}s"
+        self.count_var.set(base)
 
     def _append_message(self, level: str, msg: str, detail: str):
         level = (level or "INFO").upper()
@@ -144,11 +150,10 @@ class VendorSendUI:
             self.errors_count += 1
         elif level == "WARN":
             self.warn_count += 1
-        elif level == "SUCCESS":
+        elif level in ("SUCCESS",):
             self.success_count += 1
         elif level == "INFO":
-            # If msg says SUCCESS, count it
-            if msg.upper().startswith("SUCCESS"):
+            if (msg or "").upper().startswith("SUCCESS"):
                 self.success_count += 1
 
         self._refresh_counts()
@@ -156,6 +161,34 @@ class VendorSendUI:
     def set(self, msg, detail=""):
         self.msg_var.set(msg or "")
         self.detail_var.set(detail or "")
+
+    def _start_countdown(self):
+        if self.auto_close_seconds <= 0:
+            return
+        if self._countdown_job is not None:
+            return  # already running
+
+        self._countdown_remaining = self.auto_close_seconds
+        self._refresh_counts()
+
+        def tick():
+            # window might already be closed
+            if not self.root.winfo_exists():
+                return
+
+            self._countdown_remaining -= 1
+            self._refresh_counts()
+
+            if self._countdown_remaining <= 0:
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
+                return
+
+            self._countdown_job = self.root.after(1000, tick)
+
+        self._countdown_job = self.root.after(1000, tick)
 
     def done(self, msg="Done", detail=""):
         try:
@@ -165,6 +198,7 @@ class VendorSendUI:
         self.pb.configure(mode="determinate", value=100)
         self.set(msg, detail)
         self.close_btn.configure(state="normal")
+        self._start_countdown()
 
     def error(self, msg="Error", detail=""):
         try:
@@ -174,6 +208,7 @@ class VendorSendUI:
         self.set(msg, detail)
         self._append_message("ERROR", msg, detail)
         self.close_btn.configure(state="normal")
+        self._start_countdown()
 
     def pump_queue(self):
         if self.queue is not None:
@@ -195,19 +230,14 @@ class VendorSendUI:
 
                         self.set(msg, detail)
 
-                        # IMPORTANT: append ALL levels so success is visible
                         if level == "DONE":
                             self._append_message("INFO", msg, detail)
                             self.done(msg, detail)
+                        elif level == "ERROR":
+                            self._append_message("ERROR", msg, detail)
+                            self.error(msg, detail)
                         else:
                             self._append_message(level, msg, detail)
-
-                        if level == "ERROR":
-                            try:
-                                self.pb.stop()
-                            except Exception:
-                                pass
-                            self.close_btn.configure(state="normal")
 
                         continue
 
