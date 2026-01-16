@@ -1,4 +1,15 @@
 # main.py  (ExportOrdersToMaceriSMS)
+# Fixes:
+# - SQI passes PO (F1032) + Vendor (F27) as EXE args; send ONLY that PO
+# - RAVYX_PO_STATUS mapping:
+#     F27   = vendor# (INT)
+#     F334  = lookup from VENDOR_TAB using vendor#
+#     F02   = 'Order Export'
+#     F29   = WARN / SUCCESS / FAILED
+#     F1081 = message (skipped UPC or error)
+#     F03   = NULL (optional)
+# - WARN row inserted AFTER delete, only if delete happened
+# - If final failure, set PO back to F1067='OPEN'
 
 import os
 import sys
@@ -18,7 +29,7 @@ import requests
 from requests import Session
 from requests.exceptions import RequestException, Timeout, HTTPError
 
-from ui_send_PO_maceri import VendorSendUI  # your UI file/class
+from ui_send_PO_maceri import VendorSendUI
 
 
 # =============================================================================
@@ -50,8 +61,36 @@ APP_VERSION = read_version()
 
 
 # =============================================================================
-# Logging (one file per day in /LOG)
-#   ExportOrdersToMaceriSMS_logs_YYYY_MM_DD.log
+# Args from SQI
+# =============================================================================
+def _strip_quotes(s: str) -> str:
+    return (s or "").strip().strip('"').strip("'")
+
+
+def get_sqi_args() -> Tuple[str, int]:
+    """
+    SQI calls:
+      pushSMSPOtoMACERI.exe "<F1032>" "<F27>"
+    """
+    po = _strip_quotes(sys.argv[1]) if len(sys.argv) >= 2 else ""
+    vendor_raw = _strip_quotes(sys.argv[2]) if len(sys.argv) >= 3 else ""
+
+    if not po:
+        raise ValueError('Missing SQI param: F1032 (PO). Expected: exe "<F1032>" "<F27>"')
+
+    if not vendor_raw:
+        raise ValueError('Missing SQI param: F27 (Vendor). Expected: exe "<F1032>" "<F27>"')
+
+    try:
+        vendor = int(vendor_raw)
+    except Exception:
+        raise ValueError(f"Vendor F27 must be numeric/int. Got: {vendor_raw!r}")
+
+    return po, vendor
+
+
+# =============================================================================
+# Logging
 # =============================================================================
 LOG_DIR = os.path.join(BASE_DIR, "LOG")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -77,20 +116,14 @@ logging.info("=== Start run (MaceriPush) ===")
 logging.info(f"AppVersion={APP_VERSION} | Frozen={_is_frozen()} | BaseDir={BASE_DIR}")
 logging.info(f"ConfigPath={CONFIG_PATH}")
 
-_run_start = time.perf_counter()
-
-# UI auto-close countdown (handled by UI once it receives DONE)
 AUTO_CLOSE_SECONDS = 20
 
 
 # =============================================================================
-# Daily API raw log (single file per day)
+# Daily API raw log
 # =============================================================================
 API_LOG_TS = datetime.now().strftime("%Y_%m_%d")
 MACERI_API_LOG_PATH = os.path.join(LOG_DIR, f"MaceriApi_{API_LOG_TS}.log")
-
-# If True: only log errors (status >= 400) to MaceriApi_*.log
-# If False: log ALL calls (Auth + Order) to MaceriApi_*.log
 MACERI_API_LOG_ERRORS_ONLY = False
 
 
@@ -124,14 +157,12 @@ def _write_maceri_api_log(
     response_text: str,
     po_number: Optional[str] = None,
 ):
-    """
-    Append ONE entry to MaceriApi_YYYY_MM_DD.log
-    """
     if MACERI_API_LOG_ERRORS_ONLY and status_code < 400:
         return
 
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     po_part = f"PO={po_number}\n" if po_number else ""
+
     hdr_lines = []
     for k, v in (headers or {}).items():
         if k.lower() == "authorization":
@@ -176,10 +207,9 @@ def _write_maceri_api_log(
 
 
 # =============================================================================
-# Config / constants (READ config.ini next to EXE)
+# Config
 # =============================================================================
 config = configparser.ConfigParser()
-
 if not os.path.exists(CONFIG_PATH):
     raise FileNotFoundError(f"config.ini not found next to EXE/script: {CONFIG_PATH}")
 
@@ -188,9 +218,7 @@ config.read(CONFIG_PATH, encoding="utf-8")
 server_name = config["Settings"]["ServerName"]
 sql_driver = config["Settings"].get("SQLDriver", "SQL Server")
 database = config["Settings"].get("DatabaseName", "STORESQL")
-store_number = int(config["Settings"].get("StoreNumber", "0") or "0")
 
-# ---- Maceri section (URLs come from config.ini) ----
 LOCATION_ID = config["Maceri"].get("MaceriLocationID", "").strip()
 MACERI_USERNAME = config["Maceri"].get("Username", "").strip()
 MACERI_PASSWORD = config["Maceri"].get("Password", "").strip()
@@ -212,7 +240,8 @@ CUSTOMER_ID = "PLUMS"
 NOTES = "FROMAPI"
 SHIP_METHOD = "1"
 
-SENT_MARKER = "SentToVendor"  # appended to REC_HDR.F1254
+SENT_MARKER = "SentToVendor"
+MAX_INVALID_ITEM_RETRIES_PER_PO = 25
 
 logging.info(f"MaceriAuthUrl={API_AUTH_URL}")
 logging.info(f"MaceriOrderUrl={API_ORDER_URL}")
@@ -221,15 +250,12 @@ logging.info(f"MaceriApiDailyLog={MACERI_API_LOG_PATH} | ErrorsOnly={MACERI_API_
 
 
 # =============================================================================
-# Helpers: parse Maceri error + friendly message
+# Invalid item detection
 # =============================================================================
-_ITEM_NOT_FOUND_RE = re.compile(
-    r"Item\s+(?P<item>\S+)\s+with\s+Uom\s+(?P<uom>\S+)\s+not\s+found", re.IGNORECASE
-)
+_ITEM_NOT_FOUND_RE = re.compile(r"Item\s+(?P<item>\S+)\s+with\s+Uom\s+(?P<uom>\S+)\s+not\s+found", re.IGNORECASE)
 
 
 def _extract_item_not_found(detail_text: str) -> Optional[Tuple[str, str]]:
-    """Returns (item_code, uom) if matches: 'Item SUMO with Uom CS not found'."""
     if not detail_text:
         return None
     m = _ITEM_NOT_FOUND_RE.search(detail_text)
@@ -238,45 +264,7 @@ def _extract_item_not_found(detail_text: str) -> Optional[Tuple[str, str]]:
     return m.group("item").strip(), m.group("uom").strip()
 
 
-def _find_upcs_for_itemcode(po_rows, item_code: str) -> List[str]:
-    """Map vendor itemCode to UPC(s) from DB rows. Returns unique UPCs."""
-    upcs: Set[str] = set()
-    if not po_rows:
-        return []
-    item_code_u = (item_code or "").strip().upper()
-    for r in po_rows:
-        code = "" if r.ITEMCODE is None else str(r.ITEMCODE).strip().upper()
-        if code == item_code_u:
-            upc = "" if r.UPC is None else str(r.UPC).strip()
-            if upc:
-                upcs.add(upc)
-    return sorted(upcs)
-
-
-def _friendly_client_error(po: str, detail_text: str, po_rows) -> str:
-    """Client-friendly message from Maceri error."""
-    parsed = _extract_item_not_found(detail_text)
-    if parsed:
-        item_code, uom = parsed
-        upcs = _find_upcs_for_itemcode(po_rows, item_code)
-        upc_part = f"UPC(s): {', '.join(upcs)}. " if upcs else ""
-        return (
-            f"Order was NOT sent. Please validate {upc_part}"
-            f"The item code '{item_code}' does not exist in the Maceri database (UOM={uom})."
-        )
-
-    cleaned = (detail_text or "").strip()
-    if cleaned:
-        return f"Order was NOT sent. Maceri returned an error: {cleaned}"
-    return "Order was NOT sent. Maceri returned an error (see log for details)."
-
-
 def _extract_detail_from_maceri_response(raw_text: str, fallback: str) -> str:
-    """
-    Try to parse JSON like:
-      { "detail": "...", "message": "..." }
-    and return the best human-readable detail.
-    """
     if not raw_text:
         return fallback
     try:
@@ -293,26 +281,91 @@ def _extract_detail_from_maceri_response(raw_text: str, fallback: str) -> str:
     return fallback
 
 
+def _find_upcs_for_itemcode(po_rows, item_code: str) -> List[str]:
+    upcs: Set[str] = set()
+    item_code_u = (item_code or "").strip().upper()
+    for r in po_rows or []:
+        code = "" if r.ITEMCODE is None else str(r.ITEMCODE).strip().upper()
+        if code == item_code_u:
+            upc = "" if r.UPC is None else str(r.UPC).strip()
+            if upc:
+                upcs.add(upc)
+    return sorted(upcs)
+
+
+def _build_skipped_info(item_code: str, upcs: List[str]) -> str:
+    upc_join = ",".join(upcs) if upcs else ""
+    return f"{item_code}|UPC={upc_join}" if upc_join else f"{item_code}|UPC=?"
+
+
 # =============================================================================
-# SQL helpers (reuse ONE connection)
+# SQL helpers
 # =============================================================================
-def get_po_numbers(conn: pyodbc.Connection) -> List[str]:
-    query = """
-        SELECT HDR.F1032
-        FROM REC_HDR HDR
-        WHERE HDR.F902 = 'UPSHOP'
-          AND HDR.F1067 = 'CLOSE'
-          AND HDR.F1068 = 'ORDER'
-          AND (HDR.F1254 IS NULL OR HDR.F1254 NOT LIKE ?)
-        ORDER BY HDR.F1032
+def get_vendor_f334(conn: pyodbc.Connection, vendor: int) -> Optional[int]:
     """
-    like_marker = f"%{SENT_MARKER}%"
+    Get F334 from VENDOR_TAB for the vendor#
+    """
+    q = "SELECT TOP 1 F334 FROM [dbo].[VENDOR_TAB] WHERE F27 = ?"
     cur = conn.cursor()
-    cur.execute(query, (like_marker,))
-    rows = cur.fetchall()
-    po_list = [str(r[0]).strip() for r in rows if r and r[0] is not None]
-    logging.info(f"Found {len(po_list)} PO(s) eligible for Maceri push (UPSHOP/CLOSE/ORDER, not marked).")
-    return po_list
+    cur.execute(q, (vendor,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        return int(row[0]) if row[0] is not None else None
+    except Exception:
+        return None
+
+
+def insert_ravyx_po_status(
+    conn: pyodbc.Connection,
+    *,
+    po_number: str,
+    vendor: int,
+    vendor_f334: Optional[int],
+    status: str,          # WARN / SUCCESS / FAILED
+    f1081_text: str,      # UPC list or error text
+):
+    """
+    Required mapping:
+      F27   = vendor (int)
+      F334  = vendor_tab.F334 (int)  (or 0/NULL if not found)
+      F02   = 'Order Export'
+      F29   = status
+      F1081 = text message (UPC skipped, etc.)
+      F03   = NULL
+    """
+    runid = datetime.now().strftime("%y%m%d%H%M%S")
+    now = datetime.now()
+
+    # Respect F1081 length if it’s limited (yours is 5000 so ok)
+    f1081_val = (f1081_text or "").strip()
+    if not f1081_val:
+        f1081_val = None
+
+    sql = """
+        INSERT INTO [dbo].[RAVYX_PO_STATUS]
+            (F1032, F91, F02, F27, F334, F254, F29, F1081, F03)
+        VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    params = (
+        int(po_number),
+        runid,
+        "Order Export",
+        int(vendor),
+        int(vendor_f334) if vendor_f334 is not None else 0,
+        now,
+        status,
+        f1081_val,
+        None,   # F03 = NULL
+    )
+
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    conn.commit()
+    logging.info(f"RAVYX_PO_STATUS inserted: PO={po_number} Vendor={vendor} F334={vendor_f334} F29={status} F1081={f1081_val!r}")
 
 
 def get_po_data(conn: pyodbc.Connection, po_number: str):
@@ -333,9 +386,7 @@ def get_po_data(conn: pyodbc.Connection, po_number: str):
     cur.execute(query, (po_number,))
     cols = [c[0] for c in cur.description]
     Row = namedtuple("Row", cols)
-    rows = [Row(*r) for r in cur.fetchall()]
-    logging.info(f"PO {po_number}: fetched {len(rows)} line(s) from DB.")
-    return rows
+    return [Row(*r) for r in cur.fetchall()]
 
 
 def append_sent_marker(conn: pyodbc.Connection, po_number: str, marker: str = SENT_MARKER) -> bool:
@@ -355,21 +406,10 @@ def append_sent_marker(conn: pyodbc.Connection, po_number: str, marker: str = SE
     cur.execute(update_query, (marker, like_marker, marker, po_number, like_marker))
     changed = cur.rowcount > 0
     conn.commit()
-    if changed:
-        logging.info(f"PO {po_number}: appended marker '{marker}' into F1254.")
-    else:
-        logging.info(f"PO {po_number}: marker '{marker}' already present (no update).")
     return changed
 
 
 def reopen_po_on_failure(conn: pyodbc.Connection, po_number: str) -> bool:
-    """
-    If the PO was not sent, revert it to OPEN.
-    Guardrails:
-      - Only UPSHOP + ORDER
-      - Only if currently CLOSE
-      - Only if NOT already marked SentToVendor
-    """
     update_query = """
         UPDATE [dbo].[REC_HDR]
         SET F1067 = 'OPEN'
@@ -384,23 +424,32 @@ def reopen_po_on_failure(conn: pyodbc.Connection, po_number: str) -> bool:
     cur.execute(update_query, (po_number, like_marker))
     changed = cur.rowcount > 0
     conn.commit()
-
     if changed:
-        logging.warning(f"PO {po_number}: set back to OPEN (send failed).")
-    else:
-        logging.info(f"PO {po_number}: not re-opened (already OPEN / not CLOSE / already marked / not UPSHOP ORDER).")
-
+        logging.warning(f"PO {po_number}: set back to OPEN (final failure).")
     return changed
 
 
+def delete_invalid_item_from_po(conn: pyodbc.Connection, po_number: str, item_code: str) -> int:
+    q = """
+        DELETE FROM [dbo].[REC_REG]
+        WHERE F1032 = ?
+          AND F26 = ?
+    """
+    cur = conn.cursor()
+    cur.execute(q, (po_number, item_code))
+    deleted = cur.rowcount if cur.rowcount is not None else 0
+    conn.commit()
+    logging.warning(f"PO {po_number}: deleted {deleted} REC_REG line(s) for invalid itemCode(F26)={item_code}.")
+    return deleted
+
+
 # =============================================================================
-# API helpers (Session + token refresh)
+# API helpers
 # =============================================================================
 def get_api_token(session: Session) -> str:
     payload = {"userName": MACERI_USERNAME, "password": MACERI_PASSWORD, "persist": True}
     headers = {"Fb-Referer": FB_REFERER, "Content-Type": "application/json"}
 
-    logging.info("Requesting Maceri auth token ...")
     t0 = time.perf_counter()
     resp = session.post(API_AUTH_URL, headers=headers, json=payload, timeout=90)
     elapsed = time.perf_counter() - t0
@@ -421,22 +470,14 @@ def get_api_token(session: Session) -> str:
     data = resp.json()
     token = data.get("token")
     if not token:
-        logging.error(f"Auth missing token (status={resp.status_code}) body={raw_text[:300]!r}")
         raise RuntimeError("Missing token in auth response")
-
-    logging.info(f"Auth OK (status={resp.status_code}) in {elapsed:.3f}s.")
     return token
 
 
 def send_to_api(session: Session, payload: Dict[str, Any], token: str) -> Tuple[bool, int, str, str]:
-    """
-    Returns (ok, status_code, snippet, raw_text)
-    """
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     po_number = payload.get("customerPurchaseOrderNumber", "?")
-    line_count = len(payload.get("details", []))
 
-    logging.info(f"Sending PO {po_number} to Maceri: lines={line_count} ...")
     t0 = time.perf_counter()
     resp = session.post(API_ORDER_URL, headers=headers, json=payload, timeout=120)
     elapsed = time.perf_counter() - t0
@@ -455,10 +496,7 @@ def send_to_api(session: Session, payload: Dict[str, Any], token: str) -> Tuple[
         po_number=str(po_number),
     )
 
-    logging.info(f"PO {po_number}: API response status={resp.status_code} time={elapsed:.3f}s snippet={snippet!r}")
-
     if 200 <= resp.status_code < 300:
-        logging.info(f"PO {po_number}: Submitted successfully.")
         return True, resp.status_code, snippet, raw_text
 
     return False, resp.status_code, snippet, raw_text
@@ -507,36 +545,24 @@ def build_json_payload(po_rows, po_number: str) -> Tuple[Optional[Dict[str, Any]
         if row.ITEMCODE is not None and str(row.ITEMCODE).strip() == "SDLS45":
             unitOfMeasure = "BN"
 
-        reason = None
-
         itemcode = "" if row.ITEMCODE is None else str(row.ITEMCODE).strip()
         if not itemcode:
-            reason = "Missing ITEMCODE"
+            skipped += 1
+            continue
 
         try:
             qty_int = int(row.QTY)
         except Exception:
-            qty_int = 0
-            reason = reason or "Invalid QTY (non-integer)"
-
+            skipped += 1
+            continue
         if qty_int <= 0:
-            reason = reason or "Invalid QTY (<=0)"
+            skipped += 1
+            continue
 
         try:
             cost_val = float(row.COST)
         except Exception:
-            cost_val = None
-            reason = reason or "Invalid COST"
-
-        if cost_val is None:
-            reason = reason or "Missing COST"
-
-        if reason:
             skipped += 1
-            logging.info(
-                f"PO {po_number}: Skipped item UPC={row.UPC} VENDORCODE={row.ITEMCODE} "
-                f"QTY={row.QTY} UOM={unitOfMeasure} COST={row.COST} — Reason: {reason}"
-            )
             continue
 
         payload["details"].append(
@@ -544,12 +570,11 @@ def build_json_payload(po_rows, po_number: str) -> Tuple[Optional[Dict[str, Any]
         )
         valid += 1
 
-    logging.info(f"PO {po_number}: Payload summary — Valid={valid} Skipped={skipped}")
     return (payload if payload["details"] else None, valid, skipped)
 
 
 # =============================================================================
-# Worker (runs in background thread; pushes UI messages)
+# Worker
 # =============================================================================
 def worker(ui_q: Queue):
     def ui(level: str, msg: str, detail: str = ""):
@@ -558,121 +583,126 @@ def worker(ui_q: Queue):
         except Exception:
             pass
 
-    def reopen_ui(po: str, why: str):
-        """
-        Best-effort: reopen PO and show it in UI/log.
-        """
-        try:
-            if conn is not None:
-                reopened = reopen_po_on_failure(conn, str(po))
-                if reopened:
-                    ui("WARN", f"PO {po} re-opened", why)
-        except Exception as e:
-            logging.exception(f"PO {po}: Failed to re-open PO after failure: {e}")
-
-    totals = {
-        "processed_pos": 0,
-        "sent_pos": 0,
-        "skipped_pos": 0,
-        "valid_lines": 0,
-        "skipped_lines": 0,
-        "token_refresh": 0,
-    }
-
     session = requests.Session()
     conn = None
 
     try:
+        po, vendor = get_sqi_args()
+        logging.info(f"SQI args: PO={po} Vendor={vendor}")
+
         ui("INFO", f"Starting Maceri Push v{APP_VERSION}", "")
+        ui("INFO", "SQI Parameters", f"PO={po} | Vendor={vendor}")
         ui("INFO", "Loading config.ini...", os.path.basename(CONFIG_PATH))
 
         ui("INFO", "Connecting to SQL...", f"{server_name} / {database}")
         conn = pyodbc.connect(connection_string)
 
-        ui("INFO", "Searching POs to send...", "Filter: UPSHOP + CLOSE + ORDER + not SentToVendor")
-        po_numbers = get_po_numbers(conn)
-
-        if not po_numbers:
-            logging.info("No eligible POs found (UPSHOP/CLOSE/ORDER, not marked SentToVendor).")
-            ui("DONE", "No PO to send", f"No eligible POs found. Auto-close in {AUTO_CLOSE_SECONDS}s.")
-            return
+        vendor_f334 = get_vendor_f334(conn, vendor)
+        logging.info(f"Vendor lookup: F27={vendor} => F334={vendor_f334}")
 
         ui("INFO", "Authenticating with Maceri...", "")
         token = get_api_token(session)
-        ui("INFO", "Auth OK", f"PO count={len(po_numbers)}")
+        ui("INFO", "Auth OK", "Sending single PO from SQI")
 
-        for po in po_numbers:
-            totals["processed_pos"] += 1
-            ui("INFO", f"Processing PO {po}", "")
+        ui("INFO", f"Processing PO {po}", "")
 
+        invalid_retry = 0
+
+        while True:
             po_rows = get_po_data(conn, po)
             payload, valid, skipped = build_json_payload(po_rows, po)
-            totals["valid_lines"] += valid
-            totals["skipped_lines"] += skipped
 
             if not payload:
-                totals["skipped_pos"] += 1
-                ui("WARN", f"PO {po} skipped", "No valid items to send")
-                continue
+                msg = f"PO {po} has no valid items to send after cleanup."
+                ui("ERROR", f"PO {po} NOT sent", msg)
+                logging.error(msg)
+                insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="FAILED", f1081_text=msg)
+                reopen_po_on_failure(conn, str(po))
+                break
 
             try:
-                line_count = len(payload.get("details", []))
-                ui("INFO", f"Sending PO {po}", f"Lines={line_count}")
-
                 ok, status_code, snippet, raw_text = send_to_api(session, payload, token)
 
                 if not ok and status_code in (401, 403):
-                    totals["token_refresh"] += 1
                     ui("WARN", f"PO {po} auth error", f"{status_code} - refreshing token and retrying once")
                     token = get_api_token(session)
                     ok, status_code, snippet, raw_text = send_to_api(session, payload, token)
 
                 if ok:
-                    totals["sent_pos"] += 1
                     append_sent_marker(conn, po, SENT_MARKER)
                     ui("INFO", f"SUCCESS PO {po}", "Sent + marked SentToVendor")
-                else:
-                    totals["skipped_pos"] += 1
-                    detail_text = _extract_detail_from_maceri_response(raw_text, snippet)
-                    friendly = _friendly_client_error(str(po), detail_text, po_rows)
+                    insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="SUCCESS", f1081_text="")
+                    break
 
-                    ui("ERROR", f"PO {po} NOT sent", friendly)
-                    logging.error(f"PO {po}: {friendly}")
+                detail_text = _extract_detail_from_maceri_response(raw_text, snippet)
+                invalid = _extract_item_not_found(detail_text)
 
-                    # IMPORTANT: revert to OPEN when NOT sent
-                    reopen_ui(str(po), "Order was NOT sent, PO status set back to OPEN.")
+                if invalid:
+                    item_code, uom = invalid
+                    invalid_retry += 1
+
+                    upcs = _find_upcs_for_itemcode(po_rows, item_code)
+                    skipped_info = _build_skipped_info(item_code, upcs)
+
+                    # delete
+                    deleted = delete_invalid_item_from_po(conn, str(po), item_code)
+
+                    # log WARN only if deleted
+                    if deleted > 0:
+                        insert_ravyx_po_status(
+                            conn,
+                            po_number=str(po),
+                            vendor=vendor,
+                            vendor_f334=vendor_f334,
+                            status="WARN",
+                            f1081_text=skipped_info,
+                        )
+                        ui("WARN", f"PO {po} item skipped", f"{skipped_info} (removed, retrying)")
+                        logging.warning(f"PO {po}: Invalid itemCode '{item_code}' (UOM={uom}). UPC(s): {', '.join(upcs) if upcs else '?' }.")
+
+                    if invalid_retry > MAX_INVALID_ITEM_RETRIES_PER_PO:
+                        msg = f"PO {po} still failing after max invalid-item retries. Last invalid={item_code} UOM={uom}."
+                        ui("ERROR", f"PO {po} NOT sent", msg)
+                        logging.error(msg)
+                        insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="FAILED", f1081_text=msg)
+                        reopen_po_on_failure(conn, str(po))
+                        break
+
+                    continue
+
+                # other error
+                msg = f"Order was NOT sent. Maceri error: {detail_text}"
+                ui("ERROR", f"PO {po} NOT sent", msg)
+                logging.error(msg)
+                insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="FAILED", f1081_text=msg)
+                reopen_po_on_failure(conn, str(po))
+                break
 
             except (Timeout, RequestException, HTTPError) as e:
-                totals["skipped_pos"] += 1
-                ui("ERROR", f"PO {po} request error", str(e))
-                logging.exception(f"PO {po}: Request error: {e}")
-
-                # IMPORTANT: revert to OPEN on request error
-                reopen_ui(str(po), "Request failed, PO status set back to OPEN.")
+                msg = f"Request error: {e}"
+                ui("ERROR", f"PO {po} request error", msg)
+                logging.exception(msg)
+                insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="FAILED", f1081_text=msg)
+                reopen_po_on_failure(conn, str(po))
+                break
 
             except Exception as e:
-                totals["skipped_pos"] += 1
-                ui("ERROR", f"PO {po} unexpected error", str(e))
-                logging.exception(f"PO {po}: Unexpected error: {e}")
+                msg = f"Unexpected error: {e}"
+                ui("ERROR", f"PO {po} unexpected error", msg)
+                logging.exception(msg)
+                insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="FAILED", f1081_text=msg)
+                reopen_po_on_failure(conn, str(po))
+                break
 
-                # IMPORTANT: revert to OPEN on unexpected error
-                reopen_ui(str(po), "Unexpected error, PO status set back to OPEN.")
-
-        dur = round(time.perf_counter() - _run_start, 2)
-        summary = (
-            f"Processed={totals['processed_pos']} | Sent={totals['sent_pos']} | Failed/Skipped={totals['skipped_pos']} | "
-            f"ValidLines={totals['valid_lines']} | SkippedLines={totals['skipped_lines']} | "
-            f"TokenRefresh={totals['token_refresh']} | Duration={dur}s"
-        )
-
-        logging.info("Summary | " + summary)
-        logging.info("=== End run (MaceriPush) ===")
-        ui("DONE", "Maceri PO push completed", f"{summary} | Auto-close in {AUTO_CLOSE_SECONDS}s.")
+        ui("DONE", "Maceri PO push completed", f"Auto-close in {AUTO_CLOSE_SECONDS}s.")
 
     except Exception as e:
         logging.exception(f"Fatal error: {e}")
-        ui("ERROR", "Fatal error", str(e))
-        ui("DONE", "Stopped", f"See error above | Auto-close in {AUTO_CLOSE_SECONDS}s.")
+        try:
+            ui_q.put(("ERROR", "Fatal error", str(e)))
+            ui_q.put(("DONE", "Stopped", f"Auto-close in {AUTO_CLOSE_SECONDS}s."))
+        except Exception:
+            pass
 
     finally:
         try:
@@ -687,7 +717,7 @@ def worker(ui_q: Queue):
 
 
 # =============================================================================
-# Main (UI thread)
+# Main
 # =============================================================================
 def main():
     ui_q = Queue()
@@ -699,7 +729,6 @@ def main():
 
     t = threading.Thread(target=worker, args=(ui_q,), daemon=True)
     t.start()
-
     ui.run()
 
 
