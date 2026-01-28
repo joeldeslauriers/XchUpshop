@@ -3,13 +3,16 @@
 # - SQI passes PO (F1032) + Vendor (F27) as EXE args; send ONLY that PO
 # - RAVYX_PO_STATUS mapping:
 #     F27   = vendor# (INT)
-#     F334  = lookup from VENDOR_TAB using vendor#
+#     F334  = vendor name (TEXT) lookup from VENDOR_TAB using vendor#
 #     F02   = 'Order Export'
 #     F29   = WARN / SUCCESS / FAILED
 #     F1081 = message (skipped UPC or error)
-#     F03   = NULL (optional)
+#     F03   = Dept (from REC_REG.F03, take first row)
+#     F91   = REC_HDR.F91 for Order Export SUCCESS/WARN, else runid on errors
 # - WARN row inserted AFTER delete, only if delete happened
-# - If final failure, set PO back to F1067='OPEN'
+# - If NOT sent successfully, keep PO OPEN and ensure NO SentToVendor marker
+# - Purge logs based on [Settings] LogPurge (days)
+# - Clearer network/auth messages in UI (English)
 
 import os
 import sys
@@ -19,7 +22,8 @@ import threading
 import configparser
 import re
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from collections import namedtuple
 from typing import List, Tuple, Optional, Dict, Any, Set
 from queue import Queue
@@ -27,7 +31,7 @@ from queue import Queue
 import pyodbc
 import requests
 from requests import Session
-from requests.exceptions import RequestException, Timeout, HTTPError
+from requests.exceptions import RequestException, Timeout, HTTPError, ConnectionError
 
 from ui_send_PO_maceri import VendorSendUI
 
@@ -77,7 +81,6 @@ def get_sqi_args() -> Tuple[str, int]:
 
     if not po:
         raise ValueError('Missing SQI param: F1032 (PO). Expected: exe "<F1032>" "<F27>"')
-
     if not vendor_raw:
         raise ValueError('Missing SQI param: F27 (Vendor). Expected: exe "<F1032>" "<F27>"')
 
@@ -120,11 +123,94 @@ AUTO_CLOSE_SECONDS = 20
 
 
 # =============================================================================
+# Logs Purge
+# =============================================================================
+def purge_logs(log_dir: str, days_to_keep: int) -> int:
+    """
+    Delete log files older than days_to_keep in log_dir.
+    Targets:
+      - MaceriApi_YYYY_MM_DD.log
+      - ExportOrdersToMaceriSMS_logs_YYYY_MM_DD.log
+    Returns number of deleted files.
+    """
+    if days_to_keep is None or days_to_keep <= 0:
+        return 0
+
+    cutoff = datetime.now() - timedelta(days=days_to_keep)
+    deleted = 0
+
+    p = Path(log_dir)
+    if not p.exists():
+        return 0
+
+    patterns = [
+        "MaceriApi_*.log",
+        "ExportOrdersToMaceriSMS_logs_*.log",
+    ]
+
+    for pat in patterns:
+        for f in p.glob(pat):
+            try:
+                mtime = datetime.fromtimestamp(f.stat().st_mtime)
+                if mtime < cutoff:
+                    f.unlink()
+                    deleted += 1
+            except Exception as e:
+                logging.warning(f"Log purge: unable to delete {f}: {e}")
+
+    return deleted
+
+
+# =============================================================================
+# Config (read once) + Purge call
+# =============================================================================
+config = configparser.ConfigParser()
+if not os.path.exists(CONFIG_PATH):
+    raise FileNotFoundError(f"config.ini not found next to EXE/script: {CONFIG_PATH}")
+
+config.read(CONFIG_PATH, encoding="utf-8")
+
+LOG_PURGE_DAYS = config["Settings"].getint("LogPurge", fallback=30)
+try:
+    deleted = purge_logs(LOG_DIR, LOG_PURGE_DAYS)
+    logging.info(f"Log purge: deleted {deleted} file(s) older than {LOG_PURGE_DAYS} day(s).")
+except Exception as e:
+    logging.warning(f"Log purge failed: {e}")
+
+server_name = config["Settings"]["ServerName"]
+sql_driver = config["Settings"].get("SQLDriver", "SQL Server")
+database = config["Settings"].get("DatabaseName", "STORESQL")
+connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database};Trusted_Connection=yes"
+
+# Maceri settings (validated inside worker so we can still force PO open on failure)
+LOCATION_ID = config.get("Maceri", "MaceriLocationID", fallback="").strip()
+MACERI_USERNAME = config.get("Maceri", "Username", fallback="").strip()
+MACERI_PASSWORD = config.get("Maceri", "Password", fallback="").strip()
+API_AUTH_URL = config.get("Maceri", "BaseUrlAuth", fallback="").strip()
+API_ORDER_URL = config.get("Maceri", "BaseUrlOrder", fallback="").strip()
+FB_REFERER = config.get("Maceri", "FbReferer", fallback="https://tommaceri-test.fbportal.io/").strip()
+
+CUSTOMER_ID = "PLUMS"
+NOTES = "FROMAPI"
+SHIP_METHOD = "1"
+
+SENT_MARKER = "SentToVendor"
+MAX_INVALID_ITEM_RETRIES_PER_PO = 25
+
+logging.info(f"SQL={server_name} / {database}")
+logging.info(f"MaceriAuthUrl={API_AUTH_URL}")
+logging.info(f"MaceriOrderUrl={API_ORDER_URL}")
+logging.info(f"MaceriFbReferer={FB_REFERER}")
+
+
+# =============================================================================
 # Daily API raw log
 # =============================================================================
 API_LOG_TS = datetime.now().strftime("%Y_%m_%d")
 MACERI_API_LOG_PATH = os.path.join(LOG_DIR, f"MaceriApi_{API_LOG_TS}.log")
 MACERI_API_LOG_ERRORS_ONLY = False
+
+logging.info(f"MaceriApiDailyLog={MACERI_API_LOG_PATH} | ErrorsOnly={MACERI_API_LOG_ERRORS_ONLY}")
 
 
 def _mask_value(v: str, keep: int = 2) -> str:
@@ -163,10 +249,15 @@ def _write_maceri_api_log(
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     po_part = f"PO={po_number}\n" if po_number else ""
 
-    hdr_lines = []
+    hdr_lines: List[str] = []
     for k, v in (headers or {}).items():
         if k.lower() == "authorization":
-            hdr_lines.append(f"{k}: Bearer {_mask_value(v, keep=10)}")
+            vv = str(v or "").strip()
+            if vv.lower().startswith("bearer "):
+                token_only = vv.split(" ", 1)[1].strip()
+                hdr_lines.append(f"{k}: Bearer {_mask_value(token_only, keep=10)}")
+            else:
+                hdr_lines.append(f"{k}: {_mask_value(vv, keep=10)}")
         else:
             hdr_lines.append(f"{k}: {v}")
     hdr_block = "\n".join(hdr_lines)
@@ -207,52 +298,61 @@ def _write_maceri_api_log(
 
 
 # =============================================================================
-# Config
+# Clear error messages for UI (English)
 # =============================================================================
-config = configparser.ConfigParser()
-if not os.path.exists(CONFIG_PATH):
-    raise FileNotFoundError(f"config.ini not found next to EXE/script: {CONFIG_PATH}")
+def format_requests_error(e: Exception, url: str = "") -> Tuple[str, str]:
+    raw = str(e) or repr(e)
+    low = raw.lower()
 
-config.read(CONFIG_PATH, encoding="utf-8")
+    if (
+        "failed to establish a new connection" in low
+        or "newconnectionerror" in low
+        or "name or service not known" in low
+        or "nodename nor servname provided" in low
+        or "getaddrinfo failed" in low
+    ):
+        return (
+            "Network error (DNS/connection)",
+            f"Cannot reach the server.\nURL: {url}\nCheck: internet/VPN, DNS, firewall/proxy, and that the URL is correct.\n\nDetails: {raw}",
+        )
 
-server_name = config["Settings"]["ServerName"]
-sql_driver = config["Settings"].get("SQLDriver", "SQL Server")
-database = config["Settings"].get("DatabaseName", "STORESQL")
+    if "max retries exceeded" in low:
+        return (
+            "Network error (max retries)",
+            f"Server did not respond or is unreachable (max retries exceeded).\nURL: {url}\nCheck: network, firewall/proxy, and server availability.\n\nDetails: {raw}",
+        )
 
-LOCATION_ID = config["Maceri"].get("MaceriLocationID", "").strip()
-MACERI_USERNAME = config["Maceri"].get("Username", "").strip()
-MACERI_PASSWORD = config["Maceri"].get("Password", "").strip()
+    if "timed out" in low or isinstance(e, Timeout):
+        return (
+            "Network timeout",
+            f"Server is not responding in time (timeout).\nURL: {url}\nTry again later or check connectivity.\n\nDetails: {raw}",
+        )
 
-API_AUTH_URL = config["Maceri"].get("BaseUrlAuth", "").strip()
-API_ORDER_URL = config["Maceri"].get("BaseUrlOrder", "").strip()
-FB_REFERER = config["Maceri"].get("FbReferer", "https://tommaceri-test.fbportal.io/").strip()
+    if "401" in low or "unauthorized" in low:
+        return (
+            "Authentication failed (401)",
+            f"Authentication was rejected.\nURL: {url}\nCheck Username/Password in config.ini.\n\nDetails: {raw}",
+        )
 
-if not LOCATION_ID:
-    raise ValueError("Missing [Maceri] MaceriLocationID in config.ini")
-if not MACERI_USERNAME or not MACERI_PASSWORD:
-    raise ValueError("Missing [Maceri] Username/Password in config.ini")
-if not API_AUTH_URL or not API_ORDER_URL:
-    raise ValueError("Missing [Maceri] BaseUrlAuth and/or BaseUrlOrder in config.ini")
+    if "403" in low or "forbidden" in low:
+        return (
+            "Access forbidden (403)",
+            f"Access denied by the server.\nURL: {url}\nCheck account permissions on Maceri side.\n\nDetails: {raw}",
+        )
 
-connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database};Trusted_Connection=yes"
-
-CUSTOMER_ID = "PLUMS"
-NOTES = "FROMAPI"
-SHIP_METHOD = "1"
-
-SENT_MARKER = "SentToVendor"
-MAX_INVALID_ITEM_RETRIES_PER_PO = 25
-
-logging.info(f"MaceriAuthUrl={API_AUTH_URL}")
-logging.info(f"MaceriOrderUrl={API_ORDER_URL}")
-logging.info(f"MaceriFbReferer={FB_REFERER}")
-logging.info(f"MaceriApiDailyLog={MACERI_API_LOG_PATH} | ErrorsOnly={MACERI_API_LOG_ERRORS_ONLY}")
+    return (
+        "API communication error",
+        f"Unable to communicate with the API.\nURL: {url}\n\nDetails: {raw}",
+    )
 
 
 # =============================================================================
 # Invalid item detection
 # =============================================================================
-_ITEM_NOT_FOUND_RE = re.compile(r"Item\s+(?P<item>\S+)\s+with\s+Uom\s+(?P<uom>\S+)\s+not\s+found", re.IGNORECASE)
+_ITEM_NOT_FOUND_RE = re.compile(
+    r"Item\s+(?P<item>\S+)\s+with\s+Uom\s+(?P<uom>\S+)\s+not\s+found",
+    re.IGNORECASE,
+)
 
 
 def _extract_item_not_found(detail_text: str) -> Optional[Tuple[str, str]]:
@@ -301,71 +401,34 @@ def _build_skipped_info(item_code: str, upcs: List[str]) -> str:
 # =============================================================================
 # SQL helpers
 # =============================================================================
-def get_vendor_f334(conn: pyodbc.Connection, vendor: int) -> Optional[int]:
-    """
-    Get F334 from VENDOR_TAB for the vendor#
-    """
-    q = "SELECT TOP 1 F334 FROM [dbo].[VENDOR_TAB] WHERE F27 = ?"
+def get_vendor_name(conn: pyodbc.Connection, vendor: int) -> Optional[str]:
+    q = "SELECT TOP 1 LTRIM(RTRIM(CAST(F334 AS varchar(60)))) FROM [dbo].[VENDOR_TAB] WHERE F27 = ?"
     cur = conn.cursor()
     cur.execute(q, (vendor,))
     row = cur.fetchone()
     if not row:
         return None
+    name = (row[0] or "").strip()
+    return name or None
+
+
+def get_rec_hdr_f91(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
+    """
+    Returns REC_HDR.F91 for the PO. Keep as string to avoid type surprises.
+    """
     try:
-        return int(row[0]) if row[0] is not None else None
+        cur = conn.cursor()
+        cur.execute("SELECT TOP 1 F91 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        v = row[0]
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
     except Exception:
         return None
-
-
-def insert_ravyx_po_status(
-    conn: pyodbc.Connection,
-    *,
-    po_number: str,
-    vendor: int,
-    vendor_f334: Optional[int],
-    status: str,          # WARN / SUCCESS / FAILED
-    f1081_text: str,      # UPC list or error text
-):
-    """
-    Required mapping:
-      F27   = vendor (int)
-      F334  = vendor_tab.F334 (int)  (or 0/NULL if not found)
-      F02   = 'Order Export'
-      F29   = status
-      F1081 = text message (UPC skipped, etc.)
-      F03   = NULL
-    """
-    runid = datetime.now().strftime("%y%m%d%H%M%S")
-    now = datetime.now()
-
-    # Respect F1081 length if it’s limited (yours is 5000 so ok)
-    f1081_val = (f1081_text or "").strip()
-    if not f1081_val:
-        f1081_val = None
-
-    sql = """
-        INSERT INTO [dbo].[RAVYX_PO_STATUS]
-            (F1032, F91, F02, F27, F334, F254, F29, F1081, F03)
-        VALUES
-            (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """
-
-    params = (
-        int(po_number),
-        runid,
-        "Order Export",
-        int(vendor),
-        int(vendor_f334) if vendor_f334 is not None else 0,
-        now,
-        status,
-        f1081_val,
-        None,   # F03 = NULL
-    )
-
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    conn.commit()
-    logging.info(f"RAVYX_PO_STATUS inserted: PO={po_number} Vendor={vendor} F334={vendor_f334} F29={status} F1081={f1081_val!r}")
 
 
 def get_po_data(conn: pyodbc.Connection, po_number: str):
@@ -376,7 +439,8 @@ def get_po_data(conn: pyodbc.Connection, po_number: str):
             REG.F26   AS ITEMCODE,
             REG.F38   AS COST,
             REG.F75   AS QTY,
-            HDR.F254  AS DDATE
+            HDR.F254  AS DDATE,
+            REG.F03   AS DEPT
         FROM [dbo].[REC_REG] REG
         JOIN [dbo].[REC_HDR] HDR ON REG.F1032 = HDR.F1032
         WHERE REG.F1032 = ?
@@ -389,7 +453,72 @@ def get_po_data(conn: pyodbc.Connection, po_number: str):
     return [Row(*r) for r in cur.fetchall()]
 
 
-def append_sent_marker(conn: pyodbc.Connection, po_number: str, marker: str = SENT_MARKER) -> bool:
+def get_first_dept(po_rows) -> Optional[int]:
+    if not po_rows:
+        return None
+    try:
+        d = po_rows[0].DEPT
+        return int(d) if d is not None else None
+    except Exception:
+        return None
+
+
+def insert_ravyx_po_status(
+    conn: pyodbc.Connection,
+    *,
+    po_number: str,
+    vendor: int,
+    vendor_name: Optional[str],
+    status: str,  # WARN / SUCCESS / FAILED
+    f1081_text: str,
+    dept: Optional[int],
+    rec_hdr_f91: Optional[str],
+    process: str = "Order Export",
+):
+    """
+    F91 rule:
+      - For Order Export + SUCCESS/WARN => use REC_HDR.F91 if available
+      - Otherwise (errors) => use runid
+    """
+    runid = datetime.now().strftime("%y%m%d%H%M%S")
+    now = datetime.now()
+
+    f1081_val = (f1081_text or "").strip() or None
+    vname = (vendor_name or "").strip() or None
+
+    use_hdr_f91 = (process == "Order Export" and status in ("SUCCESS", "WARN") and (rec_hdr_f91 or "").strip())
+    f91_value = (rec_hdr_f91.strip() if use_hdr_f91 else runid)
+
+    sql = """
+        INSERT INTO [dbo].[RAVYX_PO_STATUS]
+            (F1032, F91, F02, F27, F334, F254, F29, F1081, F03)
+        VALUES
+            (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+
+    params = (
+        int(po_number),
+        f91_value,
+        process,
+        int(vendor),
+        vname,
+        now,
+        status,
+        f1081_val,
+        int(dept) if dept is not None else None,
+    )
+
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    conn.commit()
+
+    logging.info(
+        f"RAVYX_PO_STATUS inserted: PO={po_number} F91={f91_value} Process={process} "
+        f"Vendor={vendor} VendorName={vname!r} Dept={dept!r} F29={status} F1081={f1081_val!r}"
+    )
+
+
+def append_sent_marker(conn: pyodbc.Connection, po_number: str, marker: str) -> bool:
     update_query = """
         UPDATE [dbo].[REC_HDR]
         SET F1254 =
@@ -409,24 +538,35 @@ def append_sent_marker(conn: pyodbc.Connection, po_number: str, marker: str = SE
     return changed
 
 
-def reopen_po_on_failure(conn: pyodbc.Connection, po_number: str) -> bool:
-    update_query = """
-        UPDATE [dbo].[REC_HDR]
-        SET F1067 = 'OPEN'
-        WHERE F1032 = ?
-          AND F902 = 'UPSHOP'
-          AND F1068 = 'ORDER'
-          AND F1067 = 'CLOSE'
-          AND (F1254 IS NULL OR F1254 NOT LIKE ?)
-    """
-    like_marker = f"%{SENT_MARKER}%"
+def _clean_marker_from_f1254(f1254: Optional[str], marker: str) -> Optional[str]:
+    if not f1254:
+        return None
+    parts = [p.strip() for p in str(f1254).split("|")]
+    parts = [p for p in parts if p and p.lower() != marker.lower()]
+    cleaned = " | ".join(parts).strip()
+    return cleaned or None
+
+
+def force_keep_po_open_on_failure(conn: pyodbc.Connection, po_number: str, marker: str = SENT_MARKER) -> None:
     cur = conn.cursor()
-    cur.execute(update_query, (po_number, like_marker))
-    changed = cur.rowcount > 0
+
+    cur.execute("SELECT F1254 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
+    row = cur.fetchone()
+    current_f1254 = row[0] if row else None
+    new_f1254 = _clean_marker_from_f1254(current_f1254, marker)
+
+    cur.execute(
+        """
+        UPDATE [dbo].[REC_HDR]
+        SET F1067 = 'OPEN',
+            F1254 = ?
+        WHERE F1032 = ?
+        """,
+        (new_f1254, po_number),
+    )
     conn.commit()
-    if changed:
-        logging.warning(f"PO {po_number}: set back to OPEN (final failure).")
-    return changed
+
+    logging.warning(f"PO {po_number}: forced OPEN (failure path). Marker '{marker}' removed if present.")
 
 
 def delete_invalid_item_from_po(conn: pyodbc.Connection, po_number: str, item_code: str) -> int:
@@ -446,6 +586,23 @@ def delete_invalid_item_from_po(conn: pyodbc.Connection, po_number: str, item_co
 # =============================================================================
 # API helpers
 # =============================================================================
+def _validate_maceri_config() -> None:
+    missing = []
+    if not LOCATION_ID:
+        missing.append("[Maceri] MaceriLocationID")
+    if not MACERI_USERNAME:
+        missing.append("[Maceri] Username")
+    if not MACERI_PASSWORD:
+        missing.append("[Maceri] Password")
+    if not API_AUTH_URL:
+        missing.append("[Maceri] BaseUrlAuth")
+    if not API_ORDER_URL:
+        missing.append("[Maceri] BaseUrlOrder")
+
+    if missing:
+        raise RuntimeError("Missing config.ini value(s): " + ", ".join(missing))
+
+
 def get_api_token(session: Session) -> str:
     payload = {"userName": MACERI_USERNAME, "password": MACERI_PASSWORD, "persist": True}
     headers = {"Fb-Referer": FB_REFERER, "Content-Type": "application/json"}
@@ -584,7 +741,11 @@ def worker(ui_q: Queue):
             pass
 
     session = requests.Session()
-    conn = None
+    conn: Optional[pyodbc.Connection] = None
+
+    po = ""
+    vendor = 0
+    vendor_name: Optional[str] = None
 
     try:
         po, vendor = get_sqi_args()
@@ -597,41 +758,105 @@ def worker(ui_q: Queue):
         ui("INFO", "Connecting to SQL...", f"{server_name} / {database}")
         conn = pyodbc.connect(connection_string)
 
-        vendor_f334 = get_vendor_f334(conn, vendor)
-        logging.info(f"Vendor lookup: F27={vendor} => F334={vendor_f334}")
+        vendor_name = get_vendor_name(conn, vendor)
+        rec_hdr_f91 = get_rec_hdr_f91(conn, str(po))
+        logging.info(f"Vendor lookup: F27={vendor} => VendorName={vendor_name!r}")
+        logging.info(f"REC_HDR lookup: PO={po} => F91={rec_hdr_f91!r}")
+
+        _validate_maceri_config()
 
         ui("INFO", "Authenticating with Maceri...", "")
-        token = get_api_token(session)
-        ui("INFO", "Auth OK", "Sending single PO from SQI")
+        try:
+            token = get_api_token(session)
+            ui("INFO", "Auth OK", "Sending single PO from SQI")
+        except (ConnectionError, Timeout, HTTPError, RequestException) as e:
+            title, detail = format_requests_error(e, API_AUTH_URL)
+            ui("ERROR", title, detail)
+            logging.exception(f"Auth/network error: {e}")
+
+            insert_ravyx_po_status(
+                conn,
+                po_number=str(po),
+                vendor=vendor,
+                vendor_name=vendor_name,
+                status="FAILED",
+                f1081_text=f"AUTH failed: {title} | {detail}",
+                dept=None,
+                rec_hdr_f91=rec_hdr_f91,
+                process="Order Export",
+            )
+            force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
+            ui("DONE", "Stopped", f"Auto-close in {AUTO_CLOSE_SECONDS}s.")
+            return
 
         ui("INFO", f"Processing PO {po}", "")
-
         invalid_retry = 0
 
         while True:
             po_rows = get_po_data(conn, po)
+            dept = get_first_dept(po_rows)
+
             payload, valid, skipped = build_json_payload(po_rows, po)
 
             if not payload:
                 msg = f"PO {po} has no valid items to send after cleanup."
                 ui("ERROR", f"PO {po} NOT sent", msg)
                 logging.error(msg)
-                insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="FAILED", f1081_text=msg)
-                reopen_po_on_failure(conn, str(po))
+                insert_ravyx_po_status(
+                    conn,
+                    po_number=str(po),
+                    vendor=vendor,
+                    vendor_name=vendor_name,
+                    status="FAILED",
+                    f1081_text=msg,
+                    dept=dept,
+                    rec_hdr_f91=rec_hdr_f91,
+                    process="Order Export",
+                )
+                force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
                 break
 
             try:
                 ok, status_code, snippet, raw_text = send_to_api(session, payload, token)
 
                 if not ok and status_code in (401, 403):
-                    ui("WARN", f"PO {po} auth error", f"{status_code} - refreshing token and retrying once")
-                    token = get_api_token(session)
+                    ui("WARN", "Authentication error", "Received 401/403. Refreshing token and retrying once...")
+                    try:
+                        token = get_api_token(session)
+                    except (ConnectionError, Timeout, HTTPError, RequestException) as e:
+                        title, detail = format_requests_error(e, API_AUTH_URL)
+                        ui("ERROR", title, detail)
+                        logging.exception(f"Token refresh error: {e}")
+                        insert_ravyx_po_status(
+                            conn,
+                            po_number=str(po),
+                            vendor=vendor,
+                            vendor_name=vendor_name,
+                            status="FAILED",
+                            f1081_text=f"Token refresh failed: {title} | {detail}",
+                            dept=dept,
+                            rec_hdr_f91=rec_hdr_f91,
+                            process="Order Export",
+                        )
+                        force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
+                        break
+
                     ok, status_code, snippet, raw_text = send_to_api(session, payload, token)
 
                 if ok:
                     append_sent_marker(conn, po, SENT_MARKER)
-                    ui("INFO", f"SUCCESS PO {po}", "Sent + marked SentToVendor")
-                    insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="SUCCESS", f1081_text="")
+                    ui("INFO", f"SUCCESS PO {po}", "Sent and marked SentToVendor")
+                    insert_ravyx_po_status(
+                        conn,
+                        po_number=str(po),
+                        vendor=vendor,
+                        vendor_name=vendor_name,
+                        status="SUCCESS",
+                        f1081_text="",
+                        dept=dept,
+                        rec_hdr_f91=rec_hdr_f91,
+                        process="Order Export",
+                    )
                     break
 
                 detail_text = _extract_detail_from_maceri_response(raw_text, snippet)
@@ -644,54 +869,100 @@ def worker(ui_q: Queue):
                     upcs = _find_upcs_for_itemcode(po_rows, item_code)
                     skipped_info = _build_skipped_info(item_code, upcs)
 
-                    # delete
                     deleted = delete_invalid_item_from_po(conn, str(po), item_code)
 
-                    # log WARN only if deleted
                     if deleted > 0:
                         insert_ravyx_po_status(
                             conn,
                             po_number=str(po),
                             vendor=vendor,
-                            vendor_f334=vendor_f334,
+                            vendor_name=vendor_name,
                             status="WARN",
                             f1081_text=skipped_info,
+                            dept=dept,
+                            rec_hdr_f91=rec_hdr_f91,
+                            process="Order Export",
                         )
-                        ui("WARN", f"PO {po} item skipped", f"{skipped_info} (removed, retrying)")
-                        logging.warning(f"PO {po}: Invalid itemCode '{item_code}' (UOM={uom}). UPC(s): {', '.join(upcs) if upcs else '?' }.")
+                        ui("WARN", f"PO {po} - item skipped", f"{skipped_info} (removed, retrying)")
+                        logging.warning(
+                            f"PO {po}: Invalid itemCode '{item_code}' (UOM={uom}). "
+                            f"UPC(s): {', '.join(upcs) if upcs else '?'}."
+                        )
 
                     if invalid_retry > MAX_INVALID_ITEM_RETRIES_PER_PO:
-                        msg = f"PO {po} still failing after max invalid-item retries. Last invalid={item_code} UOM={uom}."
+                        msg = (
+                            f"PO {po} still failing after max invalid-item retries. "
+                            f"Last invalid itemCode={item_code} UOM={uom}."
+                        )
                         ui("ERROR", f"PO {po} NOT sent", msg)
                         logging.error(msg)
-                        insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="FAILED", f1081_text=msg)
-                        reopen_po_on_failure(conn, str(po))
+                        insert_ravyx_po_status(
+                            conn,
+                            po_number=str(po),
+                            vendor=vendor,
+                            vendor_name=vendor_name,
+                            status="FAILED",
+                            f1081_text=msg,
+                            dept=dept,
+                            rec_hdr_f91=rec_hdr_f91,
+                            process="Order Export",
+                        )
+                        force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
                         break
 
                     continue
 
-                # other error
                 msg = f"Order was NOT sent. Maceri error: {detail_text}"
                 ui("ERROR", f"PO {po} NOT sent", msg)
                 logging.error(msg)
-                insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="FAILED", f1081_text=msg)
-                reopen_po_on_failure(conn, str(po))
+                insert_ravyx_po_status(
+                    conn,
+                    po_number=str(po),
+                    vendor=vendor,
+                    vendor_name=vendor_name,
+                    status="FAILED",
+                    f1081_text=msg,
+                    dept=dept,
+                    rec_hdr_f91=rec_hdr_f91,
+                    process="Order Export",
+                )
+                force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
                 break
 
-            except (Timeout, RequestException, HTTPError) as e:
-                msg = f"Request error: {e}"
-                ui("ERROR", f"PO {po} request error", msg)
-                logging.exception(msg)
-                insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="FAILED", f1081_text=msg)
-                reopen_po_on_failure(conn, str(po))
+            except (ConnectionError, Timeout, HTTPError, RequestException) as e:
+                title, detail = format_requests_error(e, API_ORDER_URL)
+                ui("ERROR", title, detail)
+                logging.exception(f"Network/API error: {e}")
+                insert_ravyx_po_status(
+                    conn,
+                    po_number=str(po),
+                    vendor=vendor,
+                    vendor_name=vendor_name,
+                    status="FAILED",
+                    f1081_text=f"Request failed: {title} | {detail}",
+                    dept=dept,
+                    rec_hdr_f91=rec_hdr_f91,
+                    process="Order Export",
+                )
+                force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
                 break
 
             except Exception as e:
                 msg = f"Unexpected error: {e}"
-                ui("ERROR", f"PO {po} unexpected error", msg)
+                ui("ERROR", "Unexpected error", msg)
                 logging.exception(msg)
-                insert_ravyx_po_status(conn, po_number=str(po), vendor=vendor, vendor_f334=vendor_f334, status="FAILED", f1081_text=msg)
-                reopen_po_on_failure(conn, str(po))
+                insert_ravyx_po_status(
+                    conn,
+                    po_number=str(po),
+                    vendor=vendor,
+                    vendor_name=vendor_name,
+                    status="FAILED",
+                    f1081_text=msg,
+                    dept=dept,
+                    rec_hdr_f91=rec_hdr_f91,
+                    process="Order Export",
+                )
+                force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
                 break
 
         ui("DONE", "Maceri PO push completed", f"Auto-close in {AUTO_CLOSE_SECONDS}s.")
@@ -699,7 +970,18 @@ def worker(ui_q: Queue):
     except Exception as e:
         logging.exception(f"Fatal error: {e}")
         try:
-            ui_q.put(("ERROR", "Fatal error", str(e)))
+            if conn is not None and po:
+                try:
+                    force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
+                except Exception:
+                    pass
+
+            err_txt = str(e)
+            if "Missing config.ini value(s)" in err_txt:
+                ui_q.put(("ERROR", "Invalid config.ini", err_txt))
+            else:
+                ui_q.put(("ERROR", "Fatal error", err_txt))
+
             ui_q.put(("DONE", "Stopped", f"Auto-close in {AUTO_CLOSE_SECONDS}s."))
         except Exception:
             pass
