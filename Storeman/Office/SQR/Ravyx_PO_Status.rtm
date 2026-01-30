@@ -82,10 +82,10 @@ object ppReport1: TppReport
       Font.Size = 9
       Font.Style = [fsBold]
       Transparent = True
-      mmHeight = 3700
+      mmHeight = 3704
       mmLeft = 5027
-      mmTop = 27000
-      mmWidth = 18000
+      mmTop = 26988
+      mmWidth = 16404
       BandType = 0
     end
     object ppHdrCol2: TppLabel
@@ -97,10 +97,10 @@ object ppReport1: TppReport
       Font.Size = 9
       Font.Style = [fsBold]
       Transparent = True
-      mmHeight = 3700
-      mmLeft = 28000
-      mmTop = 27000
-      mmWidth = 9000
+      mmHeight = 3704
+      mmLeft = 23283
+      mmTop = 26988
+      mmWidth = 8996
       BandType = 0
     end
     object ppHdrCol3: TppLabel
@@ -112,10 +112,10 @@ object ppReport1: TppReport
       Font.Size = 9
       Font.Style = [fsBold]
       Transparent = True
-      mmHeight = 3700
-      mmLeft = 42000
-      mmTop = 27000
-      mmWidth = 15000
+      mmHeight = 3704
+      mmLeft = 36777
+      mmTop = 26988
+      mmWidth = 15081
       BandType = 0
     end
     object ppHdrCol4: TppLabel
@@ -128,9 +128,9 @@ object ppReport1: TppReport
       Font.Style = [fsBold]
       Transparent = True
       mmHeight = 3704
-      mmLeft = 67998
-      mmTop = 26988
-      mmWidth = 16933
+      mmLeft = 59267
+      mmTop = 27517
+      mmWidth = 12435
       BandType = 0
     end
     object ppHdrCol5: TppLabel
@@ -142,10 +142,25 @@ object ppReport1: TppReport
       Font.Size = 9
       Font.Style = [fsBold]
       Transparent = True
-      mmHeight = 3700
-      mmLeft = 86000
-      mmTop = 27000
-      mmWidth = 22000
+      mmHeight = 3704
+      mmLeft = 72761
+      mmTop = 27517
+      mmWidth = 21960
+      BandType = 0
+    end
+    object ppHdrColProcess: TppLabel
+      UserName = 'ppHdrColProcess'
+      Caption = 'Process'
+      Font.Charset = DEFAULT_CHARSET
+      Font.Color = clBlack
+      Font.Name = 'Arial'
+      Font.Size = 9
+      Font.Style = [fsBold]
+      Transparent = True
+      mmHeight = 3704
+      mmLeft = 96309
+      mmTop = 27517
+      mmWidth = 11113
       BandType = 0
     end
     object ppHdrCol6: TppLabel
@@ -157,10 +172,10 @@ object ppReport1: TppReport
       Font.Size = 9
       Font.Style = [fsBold]
       Transparent = True
-      mmHeight = 3701
-      mmLeft = 123081
-      mmTop = 27000
-      mmWidth = 11999
+      mmHeight = 3704
+      mmLeft = 114036
+      mmTop = 28046
+      mmWidth = 8996
       BandType = 0
     end
     object ppHdrCol7: TppLabel
@@ -172,10 +187,10 @@ object ppReport1: TppReport
       Font.Size = 9
       Font.Style = [fsBold]
       Transparent = True
-      mmHeight = 3701
-      mmLeft = 140541
-      mmTop = 27000
-      mmWidth = 8001
+      mmHeight = 3704
+      mmLeft = 128323
+      mmTop = 27781
+      mmWidth = 6879
       BandType = 0
     end
     object ppHdrCol8: TppLabel
@@ -187,10 +202,10 @@ object ppReport1: TppReport
       Font.Size = 9
       Font.Style = [fsBold]
       Transparent = True
-      mmHeight = 3700
-      mmLeft = 152000
-      mmTop = 27000
-      mmWidth = 15000
+      mmHeight = 3704
+      mmLeft = 137848
+      mmTop = 28046
+      mmWidth = 15081
       BandType = 0
     end
   end
@@ -231,10 +246,10 @@ object ppReport1: TppReport
       Font.Style = []
       Transparent = True
       DataPipelineName = 'MASTER'
-      mmHeight = 3598
-      mmLeft = 28000
+      mmHeight = 3704
+      mmLeft = 22754
       mmTop = 0
-      mmWidth = 10668
+      mmWidth = 10583
       BandType = 4
     end
     object ppDBTextPO: TppDBText
@@ -251,9 +266,9 @@ object ppReport1: TppReport
       WordWrap = True
       DataPipelineName = 'MASTER'
       mmHeight = 3598
-      mmLeft = 40746
+      mmLeft = 35983
       mmTop = 0
-      mmWidth = 7112
+      mmWidth = 21336
       BandType = 4
     end
     object ppDBTextVendor: TppDBText
@@ -269,9 +284,9 @@ object ppReport1: TppReport
       Transparent = True
       DataPipelineName = 'MASTER'
       mmHeight = 3598
-      mmLeft = 67733
+      mmLeft = 59267
       mmTop = 0
-      mmWidth = 8636
+      mmWidth = 8890
       BandType = 4
     end
     object ppDBTextVendName: TppDBText
@@ -287,10 +302,28 @@ object ppReport1: TppReport
       Transparent = True
       WordWrap = True
       DataPipelineName = 'MASTER'
-      mmHeight = 6519
-      mmLeft = 85990
+      mmHeight = 3260
+      mmLeft = 72496
       mmTop = 0
-      mmWidth = 25019
+      mmWidth = 19812
+      BandType = 4
+    end
+    object ppDBTextProcess: TppDBText
+      UserName = 'ppDBTextProcess'
+      AutoSize = True
+      DataField = 'F02'
+      DataPipeline = MASTER
+      Font.Charset = DEFAULT_CHARSET
+      Font.Color = clBlack
+      Font.Name = 'Arial'
+      Font.Size = 8
+      Font.Style = []
+      Transparent = True
+      DataPipelineName = 'MASTER'
+      mmHeight = 3260
+      mmLeft = 95779
+      mmTop = 0
+      mmWidth = 16129
       BandType = 4
     end
     object ppDBTextStatus: TppDBText
@@ -306,8 +339,8 @@ object ppReport1: TppReport
       Transparent = True
       DataPipelineName = 'MASTER'
       mmHeight = 2879
-      mmLeft = 123081
-      mmTop = 0
+      mmLeft = 113771
+      mmTop = 794
       mmWidth = 11938
       BandType = 4
     end
@@ -324,8 +357,8 @@ object ppReport1: TppReport
       Transparent = True
       DataPipelineName = 'MASTER'
       mmHeight = 3598
-      mmLeft = 140541
-      mmTop = 0
+      mmLeft = 127794
+      mmTop = 265
       mmWidth = 3556
       BandType = 4
     end
@@ -341,10 +374,10 @@ object ppReport1: TppReport
       Transparent = True
       WordWrap = True
       DataPipelineName = 'MASTER'
-      mmHeight = 4022
-      mmLeft = 152000
+      mmHeight = 3969
+      mmLeft = 136790
       mmTop = 0
-      mmWidth = 51000
+      mmWidth = 65881
       BandType = 4
     end
   end

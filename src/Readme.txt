@@ -18,3 +18,11 @@ pyinstaller --noconfirm --clean --onefile --windowed `
   --paths src `
   --version-file src\drivers\push_sms_po_to_maceri\version_info.txt `
   src\drivers\push_sms_po_to_maceri\main.py
+
+
+
+pyinstaller --noconfirm --clean --onefile --windowed `
+  --name pushSMSPOtoUNFI `
+  --paths src `
+  --version-file src\drivers\push_sms_po_to_unfi\version_info.txt `
+  src\drivers\push_sms_po_to_unfi\main.py
