@@ -26,3 +26,13 @@ pyinstaller --noconfirm --clean --onefile --windowed `
   --paths src `
   --version-file src\drivers\push_sms_po_to_unfi\version_info.txt `
   src\drivers\push_sms_po_to_unfi\main.py
+
+
+
+pyinstaller --noconfirm --clean --onefile --windowed `
+  --name pushSMSPOtoLipari `
+  --paths src `
+  --hidden-import ui_send_PO_Lipari `
+  --add-data "src\drivers\push_sms_po_to_lipari\config.ini;." `
+  --add-data "src\drivers\push_sms_po_to_lipari\version_info.txt;." `
+  src\drivers\push_sms_po_to_lipari\main.py
