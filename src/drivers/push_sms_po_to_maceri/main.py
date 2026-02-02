@@ -6,13 +6,23 @@
 #     F334  = vendor name (TEXT) lookup from VENDOR_TAB using vendor#
 #     F02   = 'Order Export'
 #     F29   = WARN / SUCCESS / FAILED
-#     F1081 = message (skipped UPC or error)
+#     F1081 = message (skipped UPC or error)   <-- aggregates skipped/invalid info (max 5000 chars) on SUCCESS/WARN
 #     F03   = Dept (from REC_REG.F03, take first row)
 #     F91   = REC_HDR.F91 for Order Export SUCCESS/WARN, else runid on errors
-# - WARN row inserted AFTER delete, only if delete happened
 # - If NOT sent successfully, keep PO OPEN and ensure NO SentToVendor marker
 # - Purge logs based on [Settings] LogPurge (days)
 # - Clearer network/auth messages in UI (English)
+#
+# IMPORTANT CHANGE:
+# - We NO LONGER insert an extra WARN row after delete_invalid_item_from_po().
+#   Instead, all "skipped/invalid" info is accumulated and written ONCE on final SUCCESS/WARN.
+#
+# NEW CHANGE:
+# - For "Item not found", remove "UOM CS" and show:
+#     Item not found "SUMO" 0000000003632
+#   If the UPC is no longer available (because REC_REG line got deleted), we still log:
+#     Item not found "SUMO"
+#   (and the retry will still pass because we delete the invalid REC_REG lines)
 
 import os
 import sys
@@ -393,9 +403,129 @@ def _find_upcs_for_itemcode(po_rows, item_code: str) -> List[str]:
     return sorted(upcs)
 
 
-def _build_skipped_info(item_code: str, upcs: List[str]) -> str:
-    upc_join = ",".join(upcs) if upcs else ""
-    return f"{item_code}|UPC={upc_join}" if upc_join else f"{item_code}|UPC=?"
+def _format_item_not_found_reason(item_code: str) -> str:
+    code = (item_code or "").strip() or "?"
+    return f'Item not found "{code}"'
+
+
+# =============================================================================
+# Skipped item tracking -> RAVYX_PO_STATUS.F1081 (max 5000 chars)
+# =============================================================================
+F1081_MAX_CHARS = 5000
+_NO_UPC_MARKER = "<NO_UPC>"  # internal marker so we can still print a reason even if UPC is gone
+
+
+def _normalize_upc(v: Any) -> str:
+    return "" if v is None else str(v).strip()
+
+
+def add_skip(skip_map: Dict[str, Set[str]], reason: str, upc: Any) -> None:
+    """
+    Stores UPCs per reason. If no UPC is available, stores an internal marker so the reason can still be displayed.
+    """
+    reason = (reason or "").strip() or "Skipped"
+    upc_s = _normalize_upc(upc)
+
+    if reason not in skip_map:
+        skip_map[reason] = set()
+
+    if upc_s:
+        skip_map[reason].add(upc_s)
+    else:
+        skip_map[reason].add(_NO_UPC_MARKER)
+
+
+def merge_skip_maps(dst: Dict[str, Set[str]], src: Dict[str, Set[str]]) -> None:
+    for reason, upcs in (src or {}).items():
+        if reason not in dst:
+            dst[reason] = set()
+        dst[reason].update(upcs or set())
+
+
+def build_skip_summary(
+    skip_map: Dict[str, Set[str]],
+    *,
+    max_chars: int = F1081_MAX_CHARS,
+    max_upcs_per_reason: int = 250,
+) -> str:
+    """
+    Format examples:
+      - Missing ITEMCODE 000...,000...
+      - Item not found "SUMO" 0000000003632
+      - Item not found "SUMO"                 (when UPC is no longer available)
+
+    Hard-cap to max_chars.
+    """
+    if not skip_map:
+        return ""
+
+    parts: List[str] = []
+
+    for reason in sorted(skip_map.keys()):
+        s = skip_map.get(reason) or set()
+
+        real_upcs = sorted(u for u in s if u and u != _NO_UPC_MARKER)
+        has_no_upc = (_NO_UPC_MARKER in s)
+
+        if real_upcs:
+            if max_upcs_per_reason and len(real_upcs) > max_upcs_per_reason:
+                real_upcs = real_upcs[:max_upcs_per_reason]
+            parts.append(f"{reason} " + ",".join(real_upcs))
+        elif has_no_upc:
+            # still show the reason even without UPC
+            parts.append(f"{reason}")
+        else:
+            # nothing usable
+            continue
+
+    if not parts:
+        return ""
+
+    text = " | ".join(parts)
+    if len(text) <= max_chars:
+        return text
+
+    # Trim progressively
+    trimmed_parts: List[str] = []
+    used = 0
+    for p in parts:
+        extra = (3 if trimmed_parts else 0) + len(p)
+        if used + extra > max_chars:
+            break
+        trimmed_parts.append(p)
+        used += extra
+
+    if not trimmed_parts:
+        return text[: max_chars - 3] + "..."
+
+    out = " | ".join(trimmed_parts)
+    if len(out) > max_chars:
+        out = out[: max_chars - 3] + "..."
+    return out
+
+
+def _remove_missing_itemcode_dupes(all_skips: Dict[str, Set[str]]) -> None:
+    """
+    If a UPC is already present under any 'Item not found "X"' reason,
+    remove it from 'Missing ITEMCODE' so you don't get redundant info.
+    """
+    missing = all_skips.get("Missing ITEMCODE")
+    if not missing:
+        return
+
+    item_not_found_upcs: Set[str] = set()
+    for reason, upcs in all_skips.items():
+        if reason.startswith('Item not found "'):
+            for u in (upcs or set()):
+                if u and u != _NO_UPC_MARKER:
+                    item_not_found_upcs.add(u)
+
+    if not item_not_found_upcs:
+        return
+
+    missing -= item_not_found_upcs
+    if not missing:
+        all_skips.pop("Missing ITEMCODE", None)
 
 
 # =============================================================================
@@ -413,9 +543,7 @@ def get_vendor_name(conn: pyodbc.Connection, vendor: int) -> Optional[str]:
 
 
 def get_rec_hdr_f91(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
-    """
-    Returns REC_HDR.F91 for the PO. Keep as string to avoid type surprises.
-    """
+    """Returns REC_HDR.F91 for the PO. Keep as string to avoid type surprises."""
     try:
         cur = conn.cursor()
         cur.execute("SELECT TOP 1 F91 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
@@ -483,7 +611,15 @@ def insert_ravyx_po_status(
     runid = datetime.now().strftime("%y%m%d%H%M%S")
     now = datetime.now()
 
-    f1081_val = (f1081_text or "").strip() or None
+    # cap F1081
+    f1081_val_raw = (f1081_text or "").strip()
+    f1081_val = (
+        (f1081_val_raw[: F1081_MAX_CHARS - 3] + "...")
+        if len(f1081_val_raw) > F1081_MAX_CHARS
+        else f1081_val_raw
+    )
+    f1081_val = f1081_val or None
+
     vname = (vendor_name or "").strip() or None
 
     use_hdr_f91 = (process == "Order Export" and status in ("SUCCESS", "WARN") and (rec_hdr_f91 or "").strip())
@@ -676,9 +812,13 @@ def _safe_date_to_yyyy_mm_dd(value) -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def build_json_payload(po_rows, po_number: str) -> Tuple[Optional[Dict[str, Any]], int, int]:
+def build_json_payload(po_rows, po_number: str) -> Tuple[Optional[Dict[str, Any]], int, int, Dict[str, Set[str]]]:
+    """
+    Returns:
+      payload | valid_count | skipped_count | skip_map(reason -> set(UPC))
+    """
     if not po_rows:
-        return None, 0, 0
+        return None, 0, 0, {}
 
     first = po_rows[0]
     delivery_date = _safe_date_to_yyyy_mm_dd(first.DDATE)
@@ -696,8 +836,11 @@ def build_json_payload(po_rows, po_number: str) -> Tuple[Optional[Dict[str, Any]
 
     valid = 0
     skipped = 0
+    skip_map: Dict[str, Set[str]] = {}
 
     for row in po_rows:
+        upc = getattr(row, "UPC", None)
+
         unitOfMeasure = "CS"
         if row.ITEMCODE is not None and str(row.ITEMCODE).strip() == "SDLS45":
             unitOfMeasure = "BN"
@@ -705,21 +848,25 @@ def build_json_payload(po_rows, po_number: str) -> Tuple[Optional[Dict[str, Any]
         itemcode = "" if row.ITEMCODE is None else str(row.ITEMCODE).strip()
         if not itemcode:
             skipped += 1
+            add_skip(skip_map, "Missing ITEMCODE", upc)
             continue
 
         try:
             qty_int = int(row.QTY)
         except Exception:
             skipped += 1
+            add_skip(skip_map, "Invalid QTY (non-integer)", upc)
             continue
         if qty_int <= 0:
             skipped += 1
+            add_skip(skip_map, "Invalid QTY (<=0)", upc)
             continue
 
         try:
             cost_val = float(row.COST)
         except Exception:
             skipped += 1
+            add_skip(skip_map, "Invalid COST (non-numeric)", upc)
             continue
 
         payload["details"].append(
@@ -727,7 +874,7 @@ def build_json_payload(po_rows, po_number: str) -> Tuple[Optional[Dict[str, Any]
         )
         valid += 1
 
-    return (payload if payload["details"] else None, valid, skipped)
+    return (payload if payload["details"] else None, valid, skipped, skip_map)
 
 
 # =============================================================================
@@ -792,14 +939,25 @@ def worker(ui_q: Queue):
         ui("INFO", f"Processing PO {po}", "")
         invalid_retry = 0
 
+        # Accumulate skipped UPCs across validation + API invalid items
+        all_skips: Dict[str, Set[str]] = {}
+
         while True:
             po_rows = get_po_data(conn, po)
             dept = get_first_dept(po_rows)
 
-            payload, valid, skipped = build_json_payload(po_rows, po)
+            payload, _valid, _skipped, skip_map = build_json_payload(po_rows, po)
+            merge_skip_maps(all_skips, skip_map)
+
+            # remove redundant "Missing ITEMCODE" UPCs when same UPC is already flagged as "Item not found"
+            _remove_missing_itemcode_dupes(all_skips)
 
             if not payload:
+                f1081_msg = build_skip_summary(all_skips, max_chars=F1081_MAX_CHARS)
                 msg = f"PO {po} has no valid items to send after cleanup."
+                if f1081_msg:
+                    msg = msg + " | " + f1081_msg
+
                 ui("ERROR", f"PO {po} NOT sent", msg)
                 logging.error(msg)
                 insert_ravyx_po_status(
@@ -845,14 +1003,19 @@ def worker(ui_q: Queue):
 
                 if ok:
                     append_sent_marker(conn, po, SENT_MARKER)
-                    ui("INFO", f"SUCCESS PO {po}", "Sent and marked SentToVendor")
+
+                    f1081_msg = build_skip_summary(all_skips, max_chars=F1081_MAX_CHARS)
+                    final_status = "WARN" if f1081_msg.strip() else "SUCCESS"
+
+                    ui("INFO", f"{final_status} PO {po}", "Sent and marked SentToVendor")
+
                     insert_ravyx_po_status(
                         conn,
                         po_number=str(po),
                         vendor=vendor,
                         vendor_name=vendor_name,
-                        status="SUCCESS",
-                        f1081_text="",
+                        status=final_status,
+                        f1081_text=f1081_msg,
                         dept=dept,
                         rec_hdr_f91=rec_hdr_f91,
                         process="Order Export",
@@ -863,37 +1026,34 @@ def worker(ui_q: Queue):
                 invalid = _extract_item_not_found(detail_text)
 
                 if invalid:
-                    item_code, uom = invalid
+                    item_code, _uom = invalid  # ignore UOM in displayed text
                     invalid_retry += 1
 
-                    upcs = _find_upcs_for_itemcode(po_rows, item_code)
-                    skipped_info = _build_skipped_info(item_code, upcs)
+                    # Find UPCs BEFORE deleting the REC_REG lines (so we can show them if available)
+                    upcs_before_delete = _find_upcs_for_itemcode(po_rows, item_code)
+
+                    # Desired message (no UOM):
+                    reason = _format_item_not_found_reason(item_code)
+
+                    # Add to final summary map (if UPC is gone later, we still keep the reason)
+                    if upcs_before_delete:
+                        for u in upcs_before_delete:
+                            add_skip(all_skips, reason, u)
+                    else:
+                        # UPC not available (or already deleted) -> still show reason
+                        add_skip(all_skips, reason, "")
 
                     deleted = delete_invalid_item_from_po(conn, str(po), item_code)
 
                     if deleted > 0:
-                        insert_ravyx_po_status(
-                            conn,
-                            po_number=str(po),
-                            vendor=vendor,
-                            vendor_name=vendor_name,
-                            status="WARN",
-                            f1081_text=skipped_info,
-                            dept=dept,
-                            rec_hdr_f91=rec_hdr_f91,
-                            process="Order Export",
-                        )
-                        ui("WARN", f"PO {po} - item skipped", f"{skipped_info} (removed, retrying)")
+                        ui("WARN", f"PO {po} - item skipped", f"{reason} (removed, retrying)")
                         logging.warning(
-                            f"PO {po}: Invalid itemCode '{item_code}' (UOM={uom}). "
-                            f"UPC(s): {', '.join(upcs) if upcs else '?'}."
+                            f"PO {po}: Invalid itemCode '{item_code}'. "
+                            f"UPC(s) pre-delete: {', '.join(upcs_before_delete) if upcs_before_delete else '(none)'}."
                         )
 
                     if invalid_retry > MAX_INVALID_ITEM_RETRIES_PER_PO:
-                        msg = (
-                            f"PO {po} still failing after max invalid-item retries. "
-                            f"Last invalid itemCode={item_code} UOM={uom}."
-                        )
+                        msg = f"PO {po} still failing after max invalid-item retries. Last invalid itemCode={item_code}."
                         ui("ERROR", f"PO {po} NOT sent", msg)
                         logging.error(msg)
                         insert_ravyx_po_status(
@@ -910,6 +1070,7 @@ def worker(ui_q: Queue):
                         force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
                         break
 
+                    # loop again with cleaned PO (REC_REG deleted) -> should pass
                     continue
 
                 msg = f"Order was NOT sent. Maceri error: {detail_text}"

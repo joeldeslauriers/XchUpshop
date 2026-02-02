@@ -1,6 +1,8 @@
 import tkinter as tk
 from tkinter import ttk
 from queue import Empty
+from typing import Optional, Tuple, Any
+
 
 
 class VendorSendUI:
@@ -9,10 +11,12 @@ class VendorSendUI:
 
     Queue payloads supported:
       - (msg, detail)                         # legacy
-      - (level, msg, detail)                  # new, level in {"INFO","WARN","ERROR","DONE"}
-
-    Auto close:
-      - starts countdown on DONE or ERROR (success OR error)
+      - (level, msg, detail)                  # old "new" format
+      - ("SUMMARY", level, msg)               # summary line (recommended)
+      - ("DONE", "SUCCESS", msg)              # done success
+      - ("ERROR", "FAILED", msg)              # done error
+      - ("AUTOCLOSE", "20", "")               # start countdown N seconds
+      - ("COUNTERS", key, value)              # set counters explicitly (ORDERS_SENT/WARNINGS/ERRORS)
     """
 
     def __init__(self, title="Send PO to UNFI", queue=None, auto_close_seconds: int = 0):
@@ -29,11 +33,13 @@ class VendorSendUI:
 
         self.msg_var = tk.StringVar(value="Starting...")
         self.detail_var = tk.StringVar(value="")
-        self.count_var = tk.StringVar(value="Success: 0 | Errors: 0 | Warnings: 0")
 
-        self.success_count = 0
+        # counters (business counters)
+        self.orders_sent = 0
         self.errors_count = 0
         self.warn_count = 0
+
+        self.count_var = tk.StringVar(value="Orders sent: 0 | Errors: 0 | Warnings: 0")
 
         # countdown state
         self._countdown_remaining = 0
@@ -127,18 +133,18 @@ class VendorSendUI:
 
     def _clear_messages(self):
         self.listbox.delete(0, "end")
-        self.success_count = 0
+        self.orders_sent = 0
         self.errors_count = 0
         self.warn_count = 0
         self._refresh_counts()
 
     def _refresh_counts(self):
-        base = f"Success: {self.success_count} | Errors: {self.errors_count} | Warnings: {self.warn_count}"
+        base = f"Orders sent: {self.orders_sent} | Errors: {self.errors_count} | Warnings: {self.warn_count}"
         if self._countdown_remaining > 0:
             base += f" | Auto-close in {self._countdown_remaining}s"
         self.count_var.set(base)
 
-    def _append_message(self, level: str, msg: str, detail: str):
+    def _append_message(self, level: str, msg: str, detail: str = ""):
         level = (level or "INFO").upper()
         line = f"[{level}] {msg}"
         if detail:
@@ -146,29 +152,28 @@ class VendorSendUI:
         self.listbox.insert("end", line)
         self.listbox.yview_moveto(1)
 
-        if level == "ERROR":
-            self.errors_count += 1
-        elif level == "WARN":
-            self.warn_count += 1
-        elif level in ("SUCCESS",):
-            self.success_count += 1
-        elif level == "INFO":
-            if (msg or "").upper().startswith("SUCCESS"):
-                self.success_count += 1
-
-        self._refresh_counts()
-
     def set(self, msg, detail=""):
         self.msg_var.set(msg or "")
         self.detail_var.set(detail or "")
 
-    def _start_countdown(self):
-        if self.auto_close_seconds <= 0:
+    def _start_countdown(self, seconds: Optional[int] = None):
+        # allow dynamic start via AUTOCLOSE
+        if seconds is None:
+            seconds = self.auto_close_seconds
+
+        try:
+            seconds = int(seconds or 0)
+        except Exception:
+            seconds = 0
+
+        if seconds <= 0:
             return
+
+        # if countdown already running, ignore
         if self._countdown_job is not None:
             return
 
-        self._countdown_remaining = self.auto_close_seconds
+        self._countdown_remaining = seconds
         self._refresh_counts()
 
         def tick():
@@ -197,6 +202,7 @@ class VendorSendUI:
         self.pb.configure(mode="determinate", value=100)
         self.set(msg, detail)
         self.close_btn.configure(state="normal")
+        # countdown will start via AUTOCLOSE or auto_close_seconds
         self._start_countdown()
 
     def error(self, msg="Error", detail=""):
@@ -205,9 +211,25 @@ class VendorSendUI:
         except Exception:
             pass
         self.set(msg, detail)
-        self._append_message("ERROR", msg, detail)
         self.close_btn.configure(state="normal")
         self._start_countdown()
+
+    def _handle_counters(self, key: str, value: str):
+        k = (key or "").strip().upper()
+        v = 0
+        try:
+            v = int(str(value).strip())
+        except Exception:
+            v = 0
+
+        if k in ("ORDERS_SENT", "SENT", "SUCCESS"):
+            self.orders_sent = v
+        elif k in ("WARNINGS", "WARNS", "WARN"):
+            self.warn_count = v
+        elif k in ("ERRORS", "ERRS", "ERROR"):
+            self.errors_count = v
+
+        self._refresh_counts()
 
     def pump_queue(self):
         if self.queue is not None:
@@ -222,21 +244,70 @@ class VendorSendUI:
                         self._append_message("INFO", msg, detail)
                         continue
 
-                    # new (level, msg, detail)
+                    # modern events (kind, a, b)
                     if isinstance(item, tuple) and len(item) == 3:
-                        level, msg, detail = item
-                        level = (level or "INFO").upper()
+                        kind, a, b = item
+                        kind = (kind or "INFO").upper()
 
+                        # SUMMARY (recommended)
+                        if kind == "SUMMARY":
+                            level = (a or "INFO").upper()
+                            msg = b or ""
+                            self.set(msg, "")
+                            self._append_message(level, msg, "")
+                            continue
+
+                        # COUNTERS
+                        if kind == "COUNTERS":
+                            self._handle_counters(a, b)
+                            continue
+
+                        # AUTOCLOSE
+                        if kind == "AUTOCLOSE":
+                            self._start_countdown(seconds=a)
+                            continue
+
+                        # DONE
+                        if kind == "DONE":
+                            status = (a or "").upper()
+                            msg = b or "Done"
+                            # count business success ONLY here (not on random INFO lines)
+                            if status == "SUCCESS":
+                                # If COUNTERS already set it, keep it.
+                                if self.orders_sent <= 0:
+                                    self.orders_sent = 1
+                                self._refresh_counts()
+                                self._append_message("SUCCESS", msg, "")
+                                self.done(msg, "")
+                            else:
+                                self._append_message("INFO", msg, "")
+                                self.done(msg, "")
+                            continue
+
+                        # ERROR
+                        if kind == "ERROR":
+                            status = (a or "FAILED").upper()
+                            msg = b or "Error"
+                            # increment error once (unless COUNTERS overwrote it)
+                            if self.errors_count <= 0:
+                                self.errors_count = 1
+                            self._refresh_counts()
+                            self._append_message("ERROR", f"{status}: {msg}", "")
+                            self.error(f"{status}", msg)
+                            continue
+
+                        # fallback: treat as (level, msg, detail) old format
+                        level = kind
+                        msg = a
+                        detail = b
                         self.set(msg, detail)
-
-                        if level == "DONE":
-                            self._append_message("INFO", msg, detail)
-                            self.done(msg, detail)
+                        self._append_message(level, msg, detail)
+                        # warnings/errors only on explicit level
+                        if level == "WARN":
+                            self.warn_count += 1
                         elif level == "ERROR":
-                            self._append_message("ERROR", msg, detail)
-                            self.error(msg, detail)
-                        else:
-                            self._append_message(level, msg, detail)
+                            self.errors_count += 1
+                        self._refresh_counts()
                         continue
 
                     # fallback

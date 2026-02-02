@@ -1,22 +1,3 @@
-# main.py - pushSMSPOtoUNFI (with UI + safer logging + better error capture)
-# LEGACY ONLY (NO SWAGGER)
-# Usage (from SMS): pushSMSPOtoUNFI.exe <F1032_PO> <F27_VENDOR>
-# Example: pushSMSPOtoUNFI.exe 123456 3954
-#
-# Legacy endpoint format:
-#   {ApiBaseUrl}/stores/{ApiStoreChainId}/orders?storeId={UNFI_STORE_ID}
-#
-# IMPORTANT:
-#   UNFI_STORE_ID is the 4+ digit store id (ex: 127705), NOT SMS StoreNumber (=3).
-#   It comes from vendor section: [UNFIGW]/[UNFIRC] StoreID
-#
-# DEV requires:
-#   AuthUrl=https://password-auth.dev.geniuscentral.com/
-#   ClientId=1mh9eiv2dn67vr5ugb651etn0h
-#   ApiBaseUrl=https://posapi.dev.geniuscentral.com
-#   ApiStoreChainId=142139
-#   [UNFIGW]/[UNFIRC] StoreID must be one of the DEV store ids they configured (ex: 127705)
-
 import os
 import sys
 import time
@@ -104,17 +85,20 @@ log_filename = os.path.join(LOG_DIR, f"pushSMSPOtoUNFI_logs_{log_ts}.log")
 
 
 class UIQueueHandler(logging.Handler):
-    """Mirror log lines into a UI queue as (LEVEL, MSG, DETAIL)."""
-
     def __init__(self, q: "queue.Queue"):
         super().__init__()
         self.q = q
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            msg = record.getMessage()
             lvl = record.levelname.upper()
-            self.q.put((lvl, msg, ""))
+            msg = record.getMessage()
+
+            # Only show WARN/ERROR in UI list to keep it clean
+            if lvl in ("WARNING", "WARN"):
+                self.q.put(("SUMMARY", "WARN", msg))
+            elif lvl in ("ERROR", "CRITICAL"):
+                self.q.put(("SUMMARY", "ERROR", msg))
         except Exception:
             pass
 
@@ -189,16 +173,12 @@ server_name = config["Settings"]["ServerName"]
 sql_driver = config["Settings"].get("SQLDriver", "SQL Server")
 database = config["Settings"].get("DatabaseName", "STORESQL")
 
-# SMS store number is still logged (and may be useful for other integrations),
-# but UNFI legacy storeId must come from vendor_cfg["StoreID"] (4+ digits).
 store_number_sms = int(config["Settings"].get("StoreNumber", "0"))
-
 connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database};Trusted_Connection=yes"
 
 # UNFI shared settings
 UNFI_AUTH_URL = config.get("UNFI", "AuthUrl", fallback="").strip()
 UNFI_API_BASE = config.get("UNFI", "ApiBaseUrl", fallback="").strip().rstrip("/")
-# REQUIRED for LEGACY endpoint
 UNFI_CHAIN_ID = config.get("UNFI", "ApiStoreChainId", fallback="").strip()
 
 UNFI_USERNAME = config.get("UNFI", "Username", fallback="").strip()
@@ -223,13 +203,13 @@ if not UNFI_AUTH_URL or not UNFI_API_BASE or not UNFI_USERNAME or not UNFI_PASSW
         missing.append("[UNFI] ClientId")
     raise RuntimeError("Missing config.ini value(s): " + ", ".join(missing))
 
-# Do NOT block on StoreNumber anymore for UNFI. It's not used for storeId in UNFI legacy.
 if store_number_sms <= 0:
     logging.warning("Config [Settings] StoreNumber is <= 0. Not used for UNFI storeId (uses vendor StoreID).")
 
 SENT_MARKER = "SentToVendor"
 
 
+# Second validation to not export order for other vendor than UNFI
 def vendor_section_from_f27(vendor_id: int) -> str:
     if vendor_id == 3954:
         return "UNFIGW"
@@ -239,13 +219,6 @@ def vendor_section_from_f27(vendor_id: int) -> str:
 
 
 def read_vendor_cfg(vendor_id: int) -> Dict[str, str]:
-    """
-    LEGACY endpoint uses:
-      /stores/{ApiStoreChainId}/orders?storeId={UNFI_STORE_ID}
-
-    UNFI_STORE_ID is a 4+ digit ID (ex: 127705), NOT SMS StoreNumber.
-    Read it from vendor section: [UNFIGW]/[UNFIRC] StoreID
-    """
     sect = vendor_section_from_f27(vendor_id)
     if sect not in config:
         raise RuntimeError(f"Missing config.ini section: [{sect}] for vendor {vendor_id}")
@@ -254,7 +227,6 @@ def read_vendor_cfg(vendor_id: int) -> Dict[str, str]:
         if not config[sect].get(k, "").strip():
             raise RuntimeError(f"Missing config.ini value: [{sect}] {k}")
 
-    # Validate StoreID is numeric (4+ digits usually, but just ensure numeric here)
     store_id_raw = config[sect]["StoreID"].strip().strip('"')
     if not store_id_raw.isdigit():
         raise RuntimeError(f"Invalid config.ini value: [{sect}] StoreID must be numeric. Got: {store_id_raw!r}")
@@ -263,23 +235,19 @@ def read_vendor_cfg(vendor_id: int) -> Dict[str, str]:
         "SupplierId": config[sect].get("SupplierId", str(vendor_id)).strip(),
         "SupplierName": config[sect]["SupplierName"].strip(),
         "AccountNumber": config[sect]["AccountNumber"].strip(),
-        "StoreID": store_id_raw,  # UNFI Store ID (4+ digits)
+        "StoreID": store_id_raw,
         "Section": sect,
     }
 
 
 def build_unfi_order_url(vendor_cfg: Dict[str, str]) -> str:
-    """
-    LEGACY endpoint:
-      {ApiBaseUrl}/stores/{ApiStoreChainId}/orders?storeId={UNFI_STORE_ID}
-    """
     chain_id = int(UNFI_CHAIN_ID)
     unfi_store_id = int(vendor_cfg["StoreID"])
     return f"{UNFI_API_BASE}/stores/{chain_id}/orders?storeId={unfi_store_id}"
 
 
 # =============================================================================
-# Daily API raw log (Maceri-style)
+# Daily API raw log
 # =============================================================================
 API_LOG_TS = datetime.now().strftime("%Y_%m_%d")
 UNFI_API_LOG_PATH = os.path.join(LOG_DIR, f"UNFI_Api_{API_LOG_TS}.log")
@@ -371,10 +339,56 @@ def _write_unfi_api_log(
 
 
 # =============================================================================
-# Clear error messages (like Maceri)
+# Clear error messages - IMPROVED for HTTPError 5xx (502/503/504)
 # =============================================================================
 def format_requests_error(e: Exception, url: str = "") -> Tuple[str, str]:
     raw = str(e) or repr(e)
+
+    if isinstance(e, HTTPError) and getattr(e, "response", None) is not None:
+        resp = e.response
+        status = getattr(resp, "status_code", None)
+
+        try:
+            body = (resp.text or "").strip()
+        except Exception:
+            body = ""
+
+        snippet = body[:300].replace("\n", " ") if body else ""
+
+        if status in (502, 503, 504):
+            return (
+                f"Gateway/Service unavailable ({status})",
+                "The server/proxy returned a gateway/service error.\n"
+                f"URL: {url}\n"
+                "Check: VPN/proxy/firewall, DNS overrides (hosts), or API environment outage.\n"
+                f"Response: {snippet or '(empty)'}",
+            )
+
+        if status == 401:
+            return (
+                "Authentication failed (401)",
+                "Authentication was rejected.\n"
+                f"URL: {url}\n"
+                "Check Username/Password/ClientId in config.ini.\n"
+                f"Response: {snippet or '(empty)'}",
+            )
+
+        if status == 403:
+            return (
+                "Access forbidden (403)",
+                "Access denied by the server.\n"
+                f"URL: {url}\n"
+                "Check account permissions on UNFI/SPS side.\n"
+                f"Response: {snippet or '(empty)'}",
+            )
+
+        return (
+            f"HTTP error ({status})",
+            "HTTP request failed.\n"
+            f"URL: {url}\n"
+            f"Response: {snippet or '(empty)'}\n\nDetails: {raw}",
+        )
+
     low = raw.lower()
 
     if (
@@ -386,31 +400,45 @@ def format_requests_error(e: Exception, url: str = "") -> Tuple[str, str]:
     ):
         return (
             "Network error (DNS/connection)",
-            f"Cannot reach the server.\nURL: {url}\nCheck: internet/VPN, DNS, firewall/proxy, and that the URL is correct.\n\nDetails: {raw}",
+            f"Cannot reach the server.\nURL: {url}\n"
+            "Check: internet/VPN, DNS, firewall/proxy, and that the URL is correct.\n\n"
+            f"Details: {raw}",
         )
 
     if "max retries exceeded" in low:
         return (
             "Network error (max retries)",
-            f"Server did not respond or is unreachable (max retries exceeded).\nURL: {url}\nCheck: network, firewall/proxy, and server availability.\n\nDetails: {raw}",
+            "Server did not respond or is unreachable (max retries exceeded).\n"
+            f"URL: {url}\n"
+            "Check: network, firewall/proxy, and server availability.\n\n"
+            f"Details: {raw}",
         )
 
     if "timed out" in low or isinstance(e, Timeout):
         return (
             "Network timeout",
-            f"Server is not responding in time (timeout).\nURL: {url}\nTry again later or check connectivity.\n\nDetails: {raw}",
+            "Server is not responding in time (timeout).\n"
+            f"URL: {url}\n"
+            "Try again later or check connectivity.\n\n"
+            f"Details: {raw}",
         )
 
-    if "401" in low or "unauthorized" in low:
+    if "unauthorized" in low:
         return (
             "Authentication failed (401)",
-            f"Authentication was rejected.\nURL: {url}\nCheck Username/Password/ClientId in config.ini.\n\nDetails: {raw}",
+            "Authentication was rejected.\n"
+            f"URL: {url}\n"
+            "Check Username/Password/ClientId in config.ini.\n\n"
+            f"Details: {raw}",
         )
 
-    if "403" in low or "forbidden" in low:
+    if "forbidden" in low:
         return (
             "Access forbidden (403)",
-            f"Access denied by the server.\nURL: {url}\nCheck account permissions on UNFI/SPS side.\n\nDetails: {raw}",
+            "Access denied by the server.\n"
+            f"URL: {url}\n"
+            "Check account permissions on UNFI/SPS side.\n\n"
+            f"Details: {raw}",
         )
 
     return (
@@ -504,6 +532,63 @@ def get_order_total_rec_ttl(conn: pyodbc.Connection, po_number: str) -> Optional
         return None
 
 
+# =============================================================================
+# NEW: Skip summary builder + truncation to F1081 max (5000 chars)
+# =============================================================================
+F1081_MAX_LEN = 5000
+
+
+def _truncate_5000(s: str, max_len: int = F1081_MAX_LEN) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    if len(s) <= max_len:
+        return s
+    # leave room for suffix
+    suffix = "…(truncated)"
+    keep = max_len - len(suffix)
+    if keep <= 0:
+        return s[:max_len]
+    return s[:keep].rstrip() + suffix
+
+
+def build_skip_summary(skip_map: Dict[str, List[str]], max_upcs_per_reason: int = 200) -> str:
+    """
+    skip_map: {reason: [upc1, upc2, ...]}
+    Output: "Missing ITEMCODE: 0001,0002 | Invalid QTY (<=0): 1234"
+    Then truncated to 5000 chars for F1081.
+    """
+    parts: List[str] = []
+
+    for reason, upcs in (skip_map or {}).items():
+        if not upcs:
+            continue
+
+        # de-dupe en gardant l'ordre
+        seen = set()
+        uniq: List[str] = []
+        for u in upcs:
+            u = str(u or "").strip()
+            if not u:
+                continue
+            if u not in seen:
+                seen.add(u)
+                uniq.append(u)
+
+        if not uniq:
+            continue
+
+        shown = uniq[:max_upcs_per_reason]
+        more = len(uniq) - len(shown)
+
+        seg = f"{reason}: {','.join(shown)}"
+        if more > 0:
+            seg += f" (+{more} more)"
+        parts.append(seg)
+
+    return _truncate_5000(" | ".join(parts))
+
+
 def insert_ravyx_po_status(
     conn: pyodbc.Connection,
     *,
@@ -520,6 +605,9 @@ def insert_ravyx_po_status(
     now = datetime.now()
 
     f1081_val = (f1081_text or "").strip() or None
+    if f1081_val:
+        f1081_val = _truncate_5000(f1081_val) or None
+
     vname = (vendor_name or "").strip() or None
 
     use_hdr_f91 = (process == "Order Export" and status in ("SUCCESS", "WARN") and (rec_hdr_f91 or "").strip())
@@ -583,6 +671,7 @@ def _clean_marker_from_f1254(f1254: Optional[str], marker: str) -> Optional[str]
     return cleaned or None
 
 
+# Keep the PO open when there is an error
 def force_keep_po_open_on_failure(conn: pyodbc.Connection, po_number: str, marker: str = SENT_MARKER) -> None:
     cur = conn.cursor()
 
@@ -645,15 +734,20 @@ def build_unfi_payload(
     vendor_id: int,
     vendor_cfg: Dict[str, str],
     po_rows,
-) -> Tuple[Optional[Dict[str, Any]], int, int, str]:
+) -> Tuple[Optional[Dict[str, Any]], int, int, str, Dict[str, List[str]]]:
+    """
+    Returns:
+      payload_or_none, valid_count, skipped_count, total_msg, skip_map(reason -> [upc,...])
+    """
     if not po_rows:
-        return None, 0, 0, "No REC_REG rows found for this PO."
+        return None, 0, 0, "No REC_REG rows found for this PO.", {}
 
     todays_date = datetime.now().strftime("%Y-%m-%dT%H:%M")
-    unique_order_id = str(uuid.uuid4())  # ALWAYS new per run
+    unique_order_id = str(uuid.uuid4())
 
     valid = 0
     skipped = 0
+    skip_map: Dict[str, List[str]] = {}
 
     rec_ttl_total = get_order_total_rec_ttl(conn, po_number)
 
@@ -662,13 +756,17 @@ def build_unfi_payload(
         ok, reason = _validate_row(r)
         if not ok:
             skipped += 1
-            logging.warning(f"PO {po_number}: Skipped line UPC={getattr(r,'UPC','?')} — {reason}")
+            upc = getattr(r, "UPC", "") or ""
+            skip_map.setdefault(reason, []).append(str(upc))
+            logging.warning(f"PO {po_number}: Skipped line UPC={upc} — {reason}")
             continue
-        fallback_total += float(r.COST)
+        try:
+            fallback_total += float(r.COST) * int(r.QTY)
+        except Exception:
+            fallback_total += float(r.COST)
 
     used_total = rec_ttl_total if rec_ttl_total is not None else fallback_total
 
-    # IMPORTANT: storeID in header must match the UNFI_STORE_ID used in the URL
     unfi_store_id = int(vendor_cfg["StoreID"])
 
     payload = {
@@ -721,11 +819,11 @@ def build_unfi_payload(
         valid += 1
 
     if not payload["details"]:
-        return None, valid, skipped, "No valid lines to send (payload empty)."
+        return None, valid, skipped, "No valid lines to send (payload empty).", skip_map
 
-    msg = f"orderTotal REC_TTL(F1034=8201)={rec_ttl_total} | fallback(sum valid F38)={fallback_total} | used={used_total}"
+    msg = f"orderTotal REC_TTL(F1034=8201)={rec_ttl_total} | fallback(sum valid cost*qty)={fallback_total} | used={used_total}"
     logging.info(f"PO {po_number}: {msg}")
-    return payload, valid, skipped, msg
+    return payload, valid, skipped, msg, skip_map
 
 
 # =============================================================================
@@ -743,19 +841,19 @@ def get_unfi_token(session: Session) -> str:
     _write_unfi_api_log(
         kind="AUTH",
         url=url,
-        status_code=resp.status_code,
+        status_code=getattr(resp, "status_code", 0) or 0,
         elapsed_s=elapsed,
         headers=headers,
         request_json={"client_id": UNFI_CLIENT_ID, "username": UNFI_USERNAME, "password": "***"},
-        response_text=resp.text or "",
+        response_text=getattr(resp, "text", "") or "",
         po_number=None,
     )
 
     resp.raise_for_status()
+
     data = resp.json()
     auth_res = data.get("AuthenticationResult") or {}
 
-    # Legacy scripts often used IdToken, but some environments may accept AccessToken.
     token = auth_res.get("IdToken") or auth_res.get("AccessToken")
     if not token:
         raise RuntimeError("Missing AuthenticationResult.IdToken/AccessToken in auth response")
@@ -785,11 +883,35 @@ def post_unfi_order(session: Session, token: str, payload: Dict[str, Any], vendo
     return resp
 
 
+def _extract_order_id(resp: requests.Response) -> Optional[str]:
+    try:
+        data = resp.json()
+        hdr = data.get("header") or {}
+        oid = hdr.get("orderID")
+        return str(oid) if oid is not None else None
+    except Exception:
+        return None
+
+
 # =============================================================================
 # Core job (returns exit code)
 # =============================================================================
-def run_job() -> int:
+def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
     start = time.perf_counter()
+
+    def ui_summary(level: str, msg: str):
+        if ui_q is not None:
+            ui_q.put(("SUMMARY", (level or "INFO").upper(), msg))
+
+    def ui_counters(sent: int, warns: int, errs: int):
+        if ui_q is not None:
+            ui_q.put(("COUNTERS", "ORDERS_SENT", str(sent)))
+            ui_q.put(("COUNTERS", "WARNINGS", str(warns)))
+            ui_q.put(("COUNTERS", "ERRORS", str(errs)))
+
+    def ui_autoclose(seconds: int):
+        if ui_q is not None:
+            ui_q.put(("AUTOCLOSE", str(int(seconds)), ""))
 
     po = ""
     vendor = 0
@@ -808,42 +930,38 @@ def run_job() -> int:
         except Exception as e:
             logging.warning(f"Log purge failed: {e}")
 
-        logging.info(f"SQL={server_name} / {database} | StoreNumber(SMS)={store_number_sms}")
-        logging.info(f"UNFI AuthUrl={UNFI_AUTH_URL}")
-        logging.info(f"UNFI ApiBaseUrl={UNFI_API_BASE}")
-        logging.info(f"UNFI ApiStoreChainId(legacy)={UNFI_CHAIN_ID}")
-
         po, vendor = get_sqi_args()
-        logging.info(f"SQI args: PO={po} Vendor={vendor}")
+
+        ui_summary("INFO", "Starting…")
+        ui_summary("INFO", f"Preparing PO {po}…")
 
         vendor_cfg = read_vendor_cfg(vendor)
         order_url = build_unfi_order_url(vendor_cfg)
 
-        logging.info(
-            "VendorConfig | "
-            f"Section={vendor_cfg['Section']} | SupplierName={vendor_cfg['SupplierName']} | "
-            f"AccountNumber={vendor_cfg['AccountNumber']} | UNFI_StoreID={vendor_cfg['StoreID']}"
-        )
-        logging.info(f"UNFI OrderUrl(Legacy)={order_url}")
-
         conn = pyodbc.connect(connection_string)
-
         vendor_name = get_vendor_name(conn, vendor)
         rec_hdr_f91 = get_rec_hdr_f91(conn, str(po))
-        logging.info(f"Vendor lookup: F27={vendor} => VendorName={vendor_name!r}")
-        logging.info(f"REC_HDR lookup: PO={po} => F91={rec_hdr_f91!r}")
 
         po_rows = get_po_rows(conn, po)
         dept = get_first_dept(po_rows)
 
-        payload, valid, skipped, total_msg = build_unfi_payload(
+        payload, valid, skipped, total_msg, skip_map = build_unfi_payload(
             conn=conn, po_number=str(po), vendor_id=vendor, vendor_cfg=vendor_cfg, po_rows=po_rows
         )
-        logging.info(f"PO {po}: Build summary — ValidLines={valid} SkippedLines={skipped} | {total_msg}")
+        skip_text = build_skip_summary(skip_map)  # <= 5000 chars already
+
+        ui_counters(sent=0, warns=int(skipped), errs=0)
 
         if not payload:
             msg = f"PO {po} has no valid items to send."
+            if skip_text:
+                msg = f"{msg} | {skip_text}"
+            msg = _truncate_5000(msg)
+
             logging.error(msg)
+            ui_summary("ERROR", msg)
+            ui_counters(sent=0, warns=int(skipped), errs=1)
+
             insert_ravyx_po_status(
                 conn,
                 po_number=str(po),
@@ -856,37 +974,42 @@ def run_job() -> int:
                 process="Order Export",
             )
             force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
-            logging.info("=== End run (UNFIPush) ===")
             return 1
 
-        payload_path = save_payload(str(po), vendor, payload)
-        logging.info(f"PO {po}: Payload saved: {payload_path}")
+        save_payload(str(po), vendor, payload)
 
         # Auth
         try:
-            logging.info("Authenticating…")
+            ui_summary("INFO", "Connecting…")
             token = get_unfi_token(session)
-            logging.info("Auth OK.")
+            ui_summary("INFO", "Connected.")
         except (ConnectionError, Timeout, HTTPError, RequestException) as e:
             title, detail = format_requests_error(e, UNFI_AUTH_URL)
             logging.exception(f"Auth/network error: {e}")
+
+            ui_summary("ERROR", f"Connection failed: {title}")
+            ui_counters(sent=0, warns=int(skipped), errs=1)
+
             insert_ravyx_po_status(
                 conn,
                 po_number=str(po),
                 vendor=vendor,
                 vendor_name=vendor_name,
                 status="FAILED",
-                f1081_text=f"AUTH failed: {title} | {detail}",
+                f1081_text=_truncate_5000(f"AUTH failed: {title} | {detail}"),
                 dept=dept,
                 rec_hdr_f91=rec_hdr_f91,
                 process="Order Export",
             )
             force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
-            logging.info("=== End run (UNFIPush) ===")
             return 1
         except Exception as e:
-            msg = f"Auth failed: {e}"
+            msg = _truncate_5000(f"Auth failed: {e}")
             logging.exception(msg)
+
+            ui_summary("ERROR", msg)
+            ui_counters(sent=0, warns=int(skipped), errs=1)
+
             insert_ravyx_po_status(
                 conn,
                 po_number=str(po),
@@ -899,47 +1022,56 @@ def run_job() -> int:
                 process="Order Export",
             )
             force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
-            logging.info("=== End run (UNFIPush) ===")
             return 1
 
         # Post (with 401/403 refresh once)
         try:
-            logging.info("Posting order…")
+            ui_summary("INFO", f"Sending PO {po}…")
             resp = post_unfi_order(session, token, payload, vendor_cfg)
 
             if resp.status_code in (401, 403):
                 logging.warning("Received 401/403. Refreshing token and retrying once…")
+                ui_summary("WARN", "Token expired. Retrying…")
                 token = get_unfi_token(session)
                 resp = post_unfi_order(session, token, payload, vendor_cfg)
 
         except (ConnectionError, Timeout, HTTPError, RequestException) as e:
             title, detail = format_requests_error(e, order_url)
             logging.exception(f"Network/API error: {e}")
+
+            ui_summary("ERROR", f"Send failed: {title}")
+            ui_counters(sent=0, warns=int(skipped), errs=1)
+
             insert_ravyx_po_status(
                 conn,
                 po_number=str(po),
                 vendor=vendor,
                 vendor_name=vendor_name,
                 status="FAILED",
-                f1081_text=f"Request failed: {title} | {detail}",
+                f1081_text=_truncate_5000(f"Request failed: {title} | {detail}"),
                 dept=dept,
                 rec_hdr_f91=rec_hdr_f91,
                 process="Order Export",
             )
             force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
-            logging.info("=== End run (UNFIPush) ===")
             return 1
 
         snippet = (resp.text or "")[:500].replace("\n", " ")
         logging.info(f"PO {po}: API response status={resp.status_code} snippet={snippet!r}")
 
         if 200 <= resp.status_code < 300:
+            order_id = _extract_order_id(resp)
+
             try:
                 set_po_closed(conn, str(po))
                 append_sent_marker(conn, str(po), SENT_MARKER)
             except Exception as e:
-                msg = f"Submitted OK but failed to update REC_HDR (CLOSE/SentToVendor): {e}"
+                msg = _truncate_5000(f"Submitted OK but failed to update REC_HDR (CLOSE/SentToVendor): {e}")
                 logging.exception(msg)
+
+                ui_summary("ERROR", "Sent OK but failed to update SMS (REC_HDR).")
+                ui_counters(sent=0, warns=int(skipped), errs=1)
+
                 insert_ravyx_po_status(
                     conn,
                     po_number=str(po),
@@ -951,27 +1083,38 @@ def run_job() -> int:
                     rec_hdr_f91=rec_hdr_f91,
                     process="Order Export",
                 )
-                logging.info("=== End run (UNFIPush) ===")
                 return 1
+
+            # ✅ HERE: SUCCESS or WARN with skipped UPC list in F1081 (<=5000)
+            final_status = "WARN" if skipped > 0 else "SUCCESS"
+            final_f1081 = skip_text  # e.g. "Missing ITEMCODE: 000...,000..."
 
             insert_ravyx_po_status(
                 conn,
                 po_number=str(po),
                 vendor=vendor,
                 vendor_name=vendor_name,
-                status="SUCCESS",
-                f1081_text="",
+                status=final_status,
+                f1081_text=final_f1081,
                 dept=dept,
                 rec_hdr_f91=rec_hdr_f91,
                 process="Order Export",
             )
 
+            ui_counters(sent=1, warns=int(skipped), errs=0)
             dur = round(time.perf_counter() - start, 2)
-            logging.info(f"SUCCESS | PO={po} Vendor={vendor} | Duration={dur}s")
-            logging.info("=== End run (UNFIPush) ===")
+
+            if skipped > 0 and skip_text:
+                ui_summary("WARN", f"Skipped items: {skip_text}")
+
+            if order_id:
+                ui_summary("SUCCESS", f"Order sent: PO {po} → OrderID {order_id} ({dur}s)")
+            else:
+                ui_summary("SUCCESS", f"Order sent: PO {po} ({dur}s)")
+
+            ui_autoclose(20)
             return 0
 
-        # Non-2xx => keep PO OPEN and ensure no SentToVendor marker
         if resp.status_code == 400:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             err_path = os.path.join(LOG_DIR, f"UNFI_error_PO{po}_V{vendor}_{ts}.log")
@@ -982,8 +1125,12 @@ def run_job() -> int:
             except Exception as e:
                 logging.warning(f"Unable to write 400 error file: {e}")
 
-        msg = f"Order NOT sent. HTTP={resp.status_code}. {snippet}"
+        msg = _truncate_5000(f"Order NOT sent. HTTP={resp.status_code}. {snippet}")
         logging.error(msg)
+
+        ui_summary("ERROR", f"Order NOT sent (HTTP {resp.status_code}).")
+        ui_counters(sent=0, warns=int(skipped), errs=1)
+        ui_autoclose(20)
 
         insert_ravyx_po_status(
             conn,
@@ -997,18 +1144,20 @@ def run_job() -> int:
             process="Order Export",
         )
         force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
-
-        logging.info("=== End run (UNFIPush) ===")
         return 1
 
     except Exception as e:
         logging.exception(f"Fatal error: {e}")
+        if ui_q is not None:
+            ui_q.put(("SUMMARY", "ERROR", f"Fatal error: {type(e).__name__}"))
+            ui_q.put(("COUNTERS", "ERRORS", "1"))
+            ui_q.put(("AUTOCLOSE", "20", ""))
+
         try:
             if conn is not None and po:
                 force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
         except Exception:
             pass
-        logging.info("=== End run (UNFIPush) ===")
         return 2
 
     finally:
@@ -1034,24 +1183,27 @@ def main_with_ui() -> int:
         from ui_send_PO_unfi import VendorSendUI
     except Exception as e:
         logging.warning(f"UI not available (ui_send_PO_unfi import failed): {e}")
-        return run_job()
+        return run_job(ui_q=None)
 
     ui = VendorSendUI(
         title="Send PO to UNFI",
         queue=ui_q,
-        auto_close_seconds=0,
+        auto_close_seconds=0,  # countdown will be driven by AUTOCLOSE events
     )
 
     def worker():
         try:
             logging.info("UI started.")
-            rc = run_job()
+            rc = run_job(ui_q=ui_q)
+
             if rc == 0:
-                ui_q.put(("DONE", "SUCCESS", "PO sent successfully"))
+                ui_q.put(("DONE", "SUCCESS", "Done"))
             else:
-                ui_q.put(("ERROR", "FAILED", f"ExitCode={rc} (see log)"))
+                ui_q.put(("ERROR", "FAILED", f"ExitCode={rc}"))
+                ui_q.put(("AUTOCLOSE", "20", ""))
         except Exception as ex:
-            ui_q.put(("ERROR", "Exception", f"{type(ex).__name__}: {ex}"))
+            ui_q.put(("ERROR", "FAILED", f"{type(ex).__name__}: {ex}"))
+            ui_q.put(("AUTOCLOSE", "20", ""))
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
