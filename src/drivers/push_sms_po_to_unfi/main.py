@@ -1085,7 +1085,7 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 )
                 return 1
 
-            # ✅ HERE: SUCCESS or WARN with skipped UPC list in F1081 (<=5000)
+            #SUCCESS or WARN with skipped UPC list in F1081 (<=5000)
             final_status = "WARN" if skipped > 0 else "SUCCESS"
             final_f1081 = skip_text  # e.g. "Missing ITEMCODE: 000...,000..."
 

@@ -1,29 +1,3 @@
-# main.py  (ExportOrdersToMaceriSMS)
-# Fixes:
-# - SQI passes PO (F1032) + Vendor (F27) as EXE args; send ONLY that PO
-# - RAVYX_PO_STATUS mapping:
-#     F27   = vendor# (INT)
-#     F334  = vendor name (TEXT) lookup from VENDOR_TAB using vendor#
-#     F02   = 'Order Export'
-#     F29   = WARN / SUCCESS / FAILED
-#     F1081 = message (skipped UPC or error)   <-- aggregates skipped/invalid info (max 5000 chars) on SUCCESS/WARN
-#     F03   = Dept (from REC_REG.F03, take first row)
-#     F91   = REC_HDR.F91 for Order Export SUCCESS/WARN, else runid on errors
-# - If NOT sent successfully, keep PO OPEN and ensure NO SentToVendor marker
-# - Purge logs based on [Settings] LogPurge (days)
-# - Clearer network/auth messages in UI (English)
-#
-# IMPORTANT CHANGE:
-# - We NO LONGER insert an extra WARN row after delete_invalid_item_from_po().
-#   Instead, all "skipped/invalid" info is accumulated and written ONCE on final SUCCESS/WARN.
-#
-# NEW CHANGE:
-# - For "Item not found", remove "UOM CS" and show:
-#     Item not found "SUMO" 0000000003632
-#   If the UPC is no longer available (because REC_REG line got deleted), we still log:
-#     Item not found "SUMO"
-#   (and the retry will still pass because we delete the invalid REC_REG lines)
-
 import os
 import sys
 import time
@@ -308,7 +282,7 @@ def _write_maceri_api_log(
 
 
 # =============================================================================
-# Clear error messages for UI (English)
+# Clear error messages for UI 
 # =============================================================================
 def format_requests_error(e: Exception, url: str = "") -> Tuple[str, str]:
     raw = str(e) or repr(e)
@@ -507,7 +481,7 @@ def build_skip_summary(
 def _remove_missing_itemcode_dupes(all_skips: Dict[str, Set[str]]) -> None:
     """
     If a UPC is already present under any 'Item not found "X"' reason,
-    remove it from 'Missing ITEMCODE' so you don't get redundant info.
+    remove it from 'Missing ITEMCODE'.
     """
     missing = all_skips.get("Missing ITEMCODE")
     if not missing:
@@ -1029,13 +1003,13 @@ def worker(ui_q: Queue):
                     item_code, _uom = invalid  # ignore UOM in displayed text
                     invalid_retry += 1
 
-                    # Find UPCs BEFORE deleting the REC_REG lines (so we can show them if available)
+                    # Find UPCs BEFORE deleting the REC_REG lines 
                     upcs_before_delete = _find_upcs_for_itemcode(po_rows, item_code)
 
                     # Desired message (no UOM):
                     reason = _format_item_not_found_reason(item_code)
 
-                    # Add to final summary map (if UPC is gone later, we still keep the reason)
+                    # Add to final summary map 
                     if upcs_before_delete:
                         for u in upcs_before_delete:
                             add_skip(all_skips, reason, u)
@@ -1070,7 +1044,7 @@ def worker(ui_q: Queue):
                         force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
                         break
 
-                    # loop again with cleaned PO (REC_REG deleted) -> should pass
+                    # loop again with cleaned PO (REC_REG deleted) 
                     continue
 
                 msg = f"Order was NOT sent. Maceri error: {detail_text}"
