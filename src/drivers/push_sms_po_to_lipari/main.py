@@ -1,5 +1,3 @@
-
-
 import os
 import sys
 import csv
@@ -131,11 +129,8 @@ def purge_logs(log_dir: str, days_to_keep: int) -> int:
     if not p.exists():
         return 0
 
-    # Only main logs (we merged everything)
     patterns = [
         "pushSMSPOtoLipari_logs_*.log",
-        # If you ever generate "payload" csv logs again, add it here.
-        # "Lipari_payload_*.csv",
     ]
 
     for pat in patterns:
@@ -190,6 +185,11 @@ if "Lipari_Departments" in config:
         LIPARI_DEPT_MAP[str(k).strip()] = str(v).strip()
 
 connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database};Trusted_Connection=yes"
+
+# =============================================================================
+# NEW: Lipari marker in REC_HDR.F1254
+# =============================================================================
+LIPARI_SENT_MARKER = "SENT_LIPARI"
 
 
 # =============================================================================
@@ -312,6 +312,40 @@ def insert_ravyx_po_status(
         f"RAVYX_PO_STATUS inserted: PO={po_number} F91={f91_value} Process={process} "
         f"Vendor={vendor} VendorName={vname!r} Dept={dept!r} F29={status} F1081={f1081_val!r}"
     )
+
+
+# =============================================================================
+# NEW: REC_HDR.F1254 marker helpers
+# =============================================================================
+def get_rec_hdr_f1254(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT TOP 1 F1254 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        s = str(row[0]).strip()
+        return s or None
+    except Exception:
+        return None
+
+
+def set_f1254_marker(conn: pyodbc.Connection, po_number: str, marker: str) -> None:
+    marker = (marker or "").strip()
+    if not marker:
+        raise ValueError("Marker is empty; cannot write F1254.")
+
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE [dbo].[REC_HDR]
+        SET F1254 = ?
+        WHERE F1032 = ?
+        """,
+        (marker, po_number),
+    )
+    conn.commit()
+    logging.info(f"PO {po_number}: REC_HDR.F1254 set to marker '{marker}'.")
 
 
 # =============================================================================
@@ -652,6 +686,31 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
             vendor_name = get_vendor_name(conn, vendor_arg) if vendor_arg else None
             rec_hdr_f91 = get_rec_hdr_f91(conn, str(po))
 
+            # NEW: skip if already marked as sent
+            existing_f1254 = get_rec_hdr_f1254(conn, str(po))
+            if existing_f1254 and existing_f1254.strip().upper() == LIPARI_SENT_MARKER:
+                msg = f"PO {po}: already sent (F1254={LIPARI_SENT_MARKER}). Skipping."
+                logging.info(msg)
+                ui_summary("WARN", msg)
+
+                try:
+                    insert_ravyx_po_status(
+                        conn,
+                        po_number=str(po),
+                        vendor=vendor_arg or 0,
+                        vendor_name=vendor_name,
+                        status="WARN",
+                        f1081_text=msg,
+                        dept=None,
+                        rec_hdr_f91=rec_hdr_f91,
+                        process="Order Export",
+                    )
+                except Exception as e2:
+                    logging.warning(f"PO {po}: unable to insert RAVYX_PO_STATUS (WARN skip): {e2}")
+
+                totals["skipped_pos"] += 1
+                continue
+
             po_rows = get_po_rows(conn, po)
 
             dept = get_first_dept_from_order(conn, po_rows)
@@ -696,7 +755,11 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 ui_summary("INFO", f"Sending PO {po} to share…")
                 dest_path = copy_backup_to_share(backup_path, po)
 
+                # SUCCESS path:
+                # - close PO
+                # - mark as SENT in F1254
                 set_po_closed(conn, po)
+                set_f1254_marker(conn, po, LIPARI_SENT_MARKER)
 
                 totals["sent_pos"] += 1
                 ui_counters(sent=totals["sent_pos"], warns=totals["skipped_lines"], errs=totals["errors"])
@@ -730,12 +793,10 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 totals["errors"] += 1
                 force_keep_po_open(conn, po)
 
-                # Keep FULL detail in the main log only
                 logging.exception(
                     f"PO {po}: send failed. {type(e).__name__}: {e} | Backup={backup_path or 'N/A'}"
                 )
 
-                # Short message for RAVYX_PO_STATUS if share unreachable
                 if _is_share_unreachable_error(e):
                     f1081_short = "Shared Folder Unreachable"
                     ui_msg = "Shared Folder Unreachable"

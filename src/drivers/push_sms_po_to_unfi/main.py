@@ -187,7 +187,14 @@ UNFI_CLIENT_ID = config.get("UNFI", "ClientId", fallback="").strip()
 TIMEOUT_AUTH_SEC = config.getint("UNFI", "TimeoutAuthSec", fallback=90)
 TIMEOUT_POST_SEC = config.getint("UNFI", "TimeoutPostSec", fallback=120)
 
-if not UNFI_AUTH_URL or not UNFI_API_BASE or not UNFI_USERNAME or not UNFI_PASSWORD or not UNFI_CLIENT_ID or not UNFI_CHAIN_ID:
+if (
+    not UNFI_AUTH_URL
+    or not UNFI_API_BASE
+    or not UNFI_USERNAME
+    or not UNFI_PASSWORD
+    or not UNFI_CLIENT_ID
+    or not UNFI_CHAIN_ID
+):
     missing = []
     if not UNFI_AUTH_URL:
         missing.append("[UNFI] AuthUrl")
@@ -205,8 +212,6 @@ if not UNFI_AUTH_URL or not UNFI_API_BASE or not UNFI_USERNAME or not UNFI_PASSW
 
 if store_number_sms <= 0:
     logging.warning("Config [Settings] StoreNumber is <= 0. Not used for UNFI storeId (uses vendor StoreID).")
-
-SENT_MARKER = "SentToVendor"
 
 
 # Second validation to not export order for other vendor than UNFI
@@ -481,6 +486,41 @@ def get_rec_hdr_f91(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
         return None
 
 
+def get_rec_hdr_f1254(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
+    """
+    Read REC_HDR.F1254 for this PO (UNFI GUID marker).
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT TOP 1 F1254 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        v = row[0]
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+    except Exception:
+        return None
+
+
+def _looks_like_guid(value: Optional[str]) -> bool:
+    """
+    True if value parses as UUID.
+    """
+    if not value:
+        return False
+    s = str(value).strip()
+    if not s:
+        return False
+    try:
+        uuid.UUID(s)
+        return True
+    except Exception:
+        return False
+
+
 def get_po_rows(conn: pyodbc.Connection, po_number: str):
     q = """
         SELECT
@@ -533,7 +573,7 @@ def get_order_total_rec_ttl(conn: pyodbc.Connection, po_number: str) -> Optional
 
 
 # =============================================================================
-# NEW: Skip summary builder + truncation to F1081 max (5000 chars)
+# truncation to F1081 max (5000 chars)
 # =============================================================================
 F1081_MAX_LEN = 5000
 
@@ -544,7 +584,6 @@ def _truncate_5000(s: str, max_len: int = F1081_MAX_LEN) -> str:
         return ""
     if len(s) <= max_len:
         return s
-    # leave room for suffix
     suffix = "…(truncated)"
     keep = max_len - len(suffix)
     if keep <= 0:
@@ -553,18 +592,12 @@ def _truncate_5000(s: str, max_len: int = F1081_MAX_LEN) -> str:
 
 
 def build_skip_summary(skip_map: Dict[str, List[str]], max_upcs_per_reason: int = 200) -> str:
-    """
-    skip_map: {reason: [upc1, upc2, ...]}
-    Output: "Missing ITEMCODE: 0001,0002 | Invalid QTY (<=0): 1234"
-    Then truncated to 5000 chars for F1081.
-    """
     parts: List[str] = []
 
     for reason, upcs in (skip_map or {}).items():
         if not upcs:
             continue
 
-        # de-dupe en gardant l'ordre
         seen = set()
         uniq: List[str] = []
         for u in upcs:
@@ -642,56 +675,42 @@ def insert_ravyx_po_status(
     )
 
 
-def append_sent_marker(conn: pyodbc.Connection, po_number: str, marker: str) -> bool:
-    update_query = """
-        UPDATE [dbo].[REC_HDR]
-        SET F1254 =
-            CASE
-                WHEN F1254 IS NULL OR LTRIM(RTRIM(F1254)) = '' THEN ?
-                WHEN F1254 LIKE ? THEN F1254
-                ELSE F1254 + ' | ' + ?
-            END
-        WHERE F1032 = ?
-          AND (F1254 IS NULL OR F1254 NOT LIKE ?)
+def set_f1254_guid(conn: pyodbc.Connection, po_number: str, guid: str) -> None:
     """
-    like_marker = f"%{marker}%"
+    UNFI: After successful POST, store the GUID in REC_HDR.F1254.
+    """
+    guid = (guid or "").strip()
+    if not guid:
+        raise ValueError("GUID is empty; cannot write F1254.")
+
     cur = conn.cursor()
-    cur.execute(update_query, (marker, like_marker, marker, po_number, like_marker))
-    changed = cur.rowcount > 0
-    conn.commit()
-    return changed
-
-
-def _clean_marker_from_f1254(f1254: Optional[str], marker: str) -> Optional[str]:
-    if not f1254:
-        return None
-    parts = [p.strip() for p in str(f1254).split("|")]
-    parts = [p for p in parts if p and p.lower() != marker.lower()]
-    cleaned = " | ".join(parts).strip()
-    return cleaned or None
-
-
-# Keep the PO open when there is an error
-def force_keep_po_open_on_failure(conn: pyodbc.Connection, po_number: str, marker: str = SENT_MARKER) -> None:
-    cur = conn.cursor()
-
-    cur.execute("SELECT F1254 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
-    row = cur.fetchone()
-    current_f1254 = row[0] if row else None
-    new_f1254 = _clean_marker_from_f1254(current_f1254, marker)
-
     cur.execute(
         """
         UPDATE [dbo].[REC_HDR]
-        SET F1067 = 'OPEN',
-            F1254 = ?
+        SET F1254 = ?
         WHERE F1032 = ?
         """,
-        (new_f1254, po_number),
+        (guid, po_number),
     )
     conn.commit()
 
-    logging.warning(f"PO {po_number}: forced OPEN (failure path). Marker '{marker}' removed if present.")
+
+def force_keep_po_open_on_failure(conn: pyodbc.Connection, po_number: str) -> None:
+    """
+    Ensure PO stays OPEN on any failure.
+    NOTE: We do NOT touch F1254 here. We only write GUID on success.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE [dbo].[REC_HDR]
+        SET F1067 = 'OPEN'
+        WHERE F1032 = ?
+        """,
+        (po_number,),
+    )
+    conn.commit()
+    logging.warning(f"PO {po_number}: forced OPEN (failure path).")
 
 
 def set_po_closed(conn: pyodbc.Connection, po_number: str) -> None:
@@ -734,15 +753,22 @@ def build_unfi_payload(
     vendor_id: int,
     vendor_cfg: Dict[str, str],
     po_rows,
-) -> Tuple[Optional[Dict[str, Any]], int, int, str, Dict[str, List[str]]]:
+) -> Tuple[Optional[Dict[str, Any]], str, int, int, str, Dict[str, List[str]]]:
     """
     Returns:
-      payload_or_none, valid_count, skipped_count, total_msg, skip_map(reason -> [upc,...])
+      payload_or_none,
+      unique_order_id (GUID),
+      valid_count,
+      skipped_count,
+      total_msg,
+      skip_map(reason -> [upc,...])
     """
     if not po_rows:
-        return None, 0, 0, "No REC_REG rows found for this PO.", {}
+        return None, "", 0, 0, "No REC_REG rows found for this PO.", {}
 
     todays_date = datetime.now().strftime("%Y-%m-%dT%H:%M")
+
+    # Correlation GUID
     unique_order_id = str(uuid.uuid4())
 
     valid = 0
@@ -819,11 +845,11 @@ def build_unfi_payload(
         valid += 1
 
     if not payload["details"]:
-        return None, valid, skipped, "No valid lines to send (payload empty).", skip_map
+        return None, unique_order_id, valid, skipped, "No valid lines to send (payload empty).", skip_map
 
     msg = f"orderTotal REC_TTL(F1034=8201)={rec_ttl_total} | fallback(sum valid cost*qty)={fallback_total} | used={used_total}"
     logging.info(f"PO {po_number}: {msg}")
-    return payload, valid, skipped, msg, skip_map
+    return payload, unique_order_id, valid, skipped, msg, skip_map
 
 
 # =============================================================================
@@ -919,6 +945,9 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
     session = requests.Session()
     conn: Optional[pyodbc.Connection] = None
 
+    # Keep for status/logging
+    unfi_guid: str = ""
+
     try:
         logging.info("=== Start run (UNFIPush) ===")
         logging.info(f"AppVersion={APP_VERSION} | Frozen={_is_frozen()} | BaseDir={BASE_DIR}")
@@ -942,13 +971,45 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
         vendor_name = get_vendor_name(conn, vendor)
         rec_hdr_f91 = get_rec_hdr_f91(conn, str(po))
 
+        # ---------------------------------------------------------------------
+        # Prevent duplicate sends:
+        # If REC_HDR.F1254 already contains a GUID, we assume the order was sent.
+        # ---------------------------------------------------------------------
+        existing_f1254 = get_rec_hdr_f1254(conn, str(po))
+        if existing_f1254 and _looks_like_guid(existing_f1254):
+            msg = (
+                f"PO {po} already has UNFI GUID in F1254 ({existing_f1254}). "
+                "Skipping send to prevent duplicate."
+            )
+            logging.warning(msg)
+            ui_summary("WARN", msg)
+
+            try:
+                insert_ravyx_po_status(
+                    conn,
+                    po_number=str(po),
+                    vendor=vendor,
+                    vendor_name=vendor_name,
+                    status="WARN",
+                    f1081_text=_truncate_5000(f"Skipped duplicate send. Existing GUID={existing_f1254}"),
+                    dept=None,
+                    rec_hdr_f91=rec_hdr_f91,
+                    process="Order Export",
+                )
+            except Exception as e:
+                logging.warning(f"Unable to insert RAVYX_PO_STATUS for duplicate-skip: {e}")
+
+            ui_counters(sent=0, warns=1, errs=0)
+            ui_autoclose(10)
+            return 0
+
         po_rows = get_po_rows(conn, po)
         dept = get_first_dept(po_rows)
 
-        payload, valid, skipped, total_msg, skip_map = build_unfi_payload(
+        payload, unfi_guid, valid, skipped, total_msg, skip_map = build_unfi_payload(
             conn=conn, po_number=str(po), vendor_id=vendor, vendor_cfg=vendor_cfg, po_rows=po_rows
         )
-        skip_text = build_skip_summary(skip_map)  # <= 5000 chars already
+        skip_text = build_skip_summary(skip_map)
 
         ui_counters(sent=0, warns=int(skipped), errs=0)
 
@@ -973,7 +1034,7 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 rec_hdr_f91=rec_hdr_f91,
                 process="Order Export",
             )
-            force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
+            force_keep_po_open_on_failure(conn, str(po))
             return 1
 
         save_payload(str(po), vendor, payload)
@@ -1001,7 +1062,7 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 rec_hdr_f91=rec_hdr_f91,
                 process="Order Export",
             )
-            force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
+            force_keep_po_open_on_failure(conn, str(po))
             return 1
         except Exception as e:
             msg = _truncate_5000(f"Auth failed: {e}")
@@ -1021,7 +1082,7 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 rec_hdr_f91=rec_hdr_f91,
                 process="Order Export",
             )
-            force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
+            force_keep_po_open_on_failure(conn, str(po))
             return 1
 
         # Post (with 401/403 refresh once)
@@ -1053,7 +1114,7 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 rec_hdr_f91=rec_hdr_f91,
                 process="Order Export",
             )
-            force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
+            force_keep_po_open_on_failure(conn, str(po))
             return 1
 
         snippet = (resp.text or "")[:500].replace("\n", " ")
@@ -1063,10 +1124,13 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
             order_id = _extract_order_id(resp)
 
             try:
+                # Success path:
+                # - close PO
+                # - store GUID in F1254 (correlation key)
                 set_po_closed(conn, str(po))
-                append_sent_marker(conn, str(po), SENT_MARKER)
+                set_f1254_guid(conn, str(po), unfi_guid)
             except Exception as e:
-                msg = _truncate_5000(f"Submitted OK but failed to update REC_HDR (CLOSE/SentToVendor): {e}")
+                msg = _truncate_5000(f"Submitted OK but failed to update REC_HDR (CLOSE/F1254=GUID): {e}")
                 logging.exception(msg)
 
                 ui_summary("ERROR", "Sent OK but failed to update SMS (REC_HDR).")
@@ -1085,9 +1149,8 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 )
                 return 1
 
-            #SUCCESS or WARN with skipped UPC list in F1081 (<=5000)
             final_status = "WARN" if skipped > 0 else "SUCCESS"
-            final_f1081 = skip_text  # e.g. "Missing ITEMCODE: 000...,000..."
+            final_f1081 = skip_text
 
             insert_ravyx_po_status(
                 conn,
@@ -1108,9 +1171,9 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 ui_summary("WARN", f"Skipped items: {skip_text}")
 
             if order_id:
-                ui_summary("SUCCESS", f"Order sent: PO {po} → OrderID {order_id} ({dur}s)")
+                ui_summary("SUCCESS", f"Order sent: PO {po} → OrderID {order_id} | GUID {unfi_guid} ({dur}s)")
             else:
-                ui_summary("SUCCESS", f"Order sent: PO {po} ({dur}s)")
+                ui_summary("SUCCESS", f"Order sent: PO {po} | GUID {unfi_guid} ({dur}s)")
 
             ui_autoclose(20)
             return 0
@@ -1143,7 +1206,7 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
             rec_hdr_f91=rec_hdr_f91,
             process="Order Export",
         )
-        force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
+        force_keep_po_open_on_failure(conn, str(po))
         return 1
 
     except Exception as e:
@@ -1155,7 +1218,7 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
 
         try:
             if conn is not None and po:
-                force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
+                force_keep_po_open_on_failure(conn, str(po))
         except Exception:
             pass
         return 2
@@ -1188,7 +1251,7 @@ def main_with_ui() -> int:
     ui = VendorSendUI(
         title="Send PO to UNFI",
         queue=ui_q,
-        auto_close_seconds=0,  # countdown will be driven by AUTOCLOSE events
+        auto_close_seconds=0,
     )
 
     def worker():

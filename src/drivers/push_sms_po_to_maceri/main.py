@@ -55,13 +55,20 @@ def _strip_quotes(s: str) -> str:
     return (s or "").strip().strip('"').strip("'")
 
 
-def get_sqi_args() -> Tuple[str, int]:
+def get_sqi_args() -> Tuple[str, int, bool]:
     """
     SQI calls:
       pushSMSPOtoMACERI.exe "<F1032>" "<F27>"
+
+    Optional:
+      pushSMSPOtoMACERI.exe "<F1032>" "<F27>" --force
+        -> bypass 'already sent' protection (default is to SKIP if already sent)
     """
     po = _strip_quotes(sys.argv[1]) if len(sys.argv) >= 2 else ""
     vendor_raw = _strip_quotes(sys.argv[2]) if len(sys.argv) >= 3 else ""
+    extra_args = [a.lower().strip() for a in sys.argv[3:]]
+
+    force = ("--force" in extra_args)
 
     if not po:
         raise ValueError('Missing SQI param: F1032 (PO). Expected: exe "<F1032>" "<F27>"')
@@ -73,7 +80,7 @@ def get_sqi_args() -> Tuple[str, int]:
     except Exception:
         raise ValueError(f"Vendor F27 must be numeric/int. Got: {vendor_raw!r}")
 
-    return po, vendor
+    return po, vendor, force
 
 
 # =============================================================================
@@ -178,7 +185,7 @@ CUSTOMER_ID = "PLUMS"
 NOTES = "FROMAPI"
 SHIP_METHOD = "1"
 
-SENT_MARKER = "SentToVendor"
+SENT_MARKER = "SENT_MACERI"
 MAX_INVALID_ITEM_RETRIES_PER_PO = 25
 
 logging.info(f"SQL={server_name} / {database}")
@@ -282,7 +289,7 @@ def _write_maceri_api_log(
 
 
 # =============================================================================
-# Clear error messages for UI 
+# Clear error messages for UI
 # =============================================================================
 def format_requests_error(e: Exception, url: str = "") -> Tuple[str, str]:
     raw = str(e) or repr(e)
@@ -386,7 +393,7 @@ def _format_item_not_found_reason(item_code: str) -> str:
 # Skipped item tracking -> RAVYX_PO_STATUS.F1081 (max 5000 chars)
 # =============================================================================
 F1081_MAX_CHARS = 5000
-_NO_UPC_MARKER = "<NO_UPC>"  # internal marker so we can still print a reason even if UPC is gone
+_NO_UPC_MARKER = "<NO_UPC>"
 
 
 def _normalize_upc(v: Any) -> str:
@@ -394,9 +401,6 @@ def _normalize_upc(v: Any) -> str:
 
 
 def add_skip(skip_map: Dict[str, Set[str]], reason: str, upc: Any) -> None:
-    """
-    Stores UPCs per reason. If no UPC is available, stores an internal marker so the reason can still be displayed.
-    """
     reason = (reason or "").strip() or "Skipped"
     upc_s = _normalize_upc(upc)
 
@@ -422,14 +426,6 @@ def build_skip_summary(
     max_chars: int = F1081_MAX_CHARS,
     max_upcs_per_reason: int = 250,
 ) -> str:
-    """
-    Format examples:
-      - Missing ITEMCODE 000...,000...
-      - Item not found "SUMO" 0000000003632
-      - Item not found "SUMO"                 (when UPC is no longer available)
-
-    Hard-cap to max_chars.
-    """
     if not skip_map:
         return ""
 
@@ -446,10 +442,8 @@ def build_skip_summary(
                 real_upcs = real_upcs[:max_upcs_per_reason]
             parts.append(f"{reason} " + ",".join(real_upcs))
         elif has_no_upc:
-            # still show the reason even without UPC
             parts.append(f"{reason}")
         else:
-            # nothing usable
             continue
 
     if not parts:
@@ -459,7 +453,6 @@ def build_skip_summary(
     if len(text) <= max_chars:
         return text
 
-    # Trim progressively
     trimmed_parts: List[str] = []
     used = 0
     for p in parts:
@@ -479,10 +472,6 @@ def build_skip_summary(
 
 
 def _remove_missing_itemcode_dupes(all_skips: Dict[str, Set[str]]) -> None:
-    """
-    If a UPC is already present under any 'Item not found "X"' reason,
-    remove it from 'Missing ITEMCODE'.
-    """
     missing = all_skips.get("Missing ITEMCODE")
     if not missing:
         return
@@ -517,7 +506,6 @@ def get_vendor_name(conn: pyodbc.Connection, vendor: int) -> Optional[str]:
 
 
 def get_rec_hdr_f91(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
-    """Returns REC_HDR.F91 for the PO. Keep as string to avoid type surprises."""
     try:
         cur = conn.cursor()
         cur.execute("SELECT TOP 1 F91 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
@@ -531,6 +519,42 @@ def get_rec_hdr_f91(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
         return s or None
     except Exception:
         return None
+
+
+def get_rec_hdr_f1254(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT TOP 1 F1254 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return str(row[0]).strip() or None
+    except Exception:
+        return None
+
+
+def is_po_already_sent(conn: pyodbc.Connection, po_number: str, marker: str) -> bool:
+    """
+    True if REC_HDR.F1254 already contains marker (case-insensitive).
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT TOP 1 1
+            FROM [dbo].[REC_HDR]
+            WHERE F1032 = ?
+              AND F1254 IS NOT NULL
+              AND LOWER(F1254) LIKE ?
+            """,
+            (po_number, f"%{marker.lower()}%"),
+        )
+        return cur.fetchone() is not None
+    except Exception:
+        # Fail-open would be dangerous (could resend), so fail-closed:
+        # if we can't check, consider it "already sent" to prevent duplicates.
+        logging.warning(f"PO {po_number}: unable to verify sent marker in F1254; blocking resend for safety.")
+        return True
 
 
 def get_po_data(conn: pyodbc.Connection, po_number: str):
@@ -577,15 +601,9 @@ def insert_ravyx_po_status(
     rec_hdr_f91: Optional[str],
     process: str = "Order Export",
 ):
-    """
-    F91 rule:
-      - For Order Export + SUCCESS/WARN => use REC_HDR.F91 if available
-      - Otherwise (errors) => use runid
-    """
     runid = datetime.now().strftime("%y%m%d%H%M%S")
     now = datetime.now()
 
-    # cap F1081
     f1081_val_raw = (f1081_text or "").strip()
     f1081_val = (
         (f1081_val_raw[: F1081_MAX_CHARS - 3] + "...")
@@ -787,10 +805,6 @@ def _safe_date_to_yyyy_mm_dd(value) -> str:
 
 
 def build_json_payload(po_rows, po_number: str) -> Tuple[Optional[Dict[str, Any]], int, int, Dict[str, Set[str]]]:
-    """
-    Returns:
-      payload | valid_count | skipped_count | skip_map(reason -> set(UPC))
-    """
     if not po_rows:
         return None, 0, 0, {}
 
@@ -867,13 +881,14 @@ def worker(ui_q: Queue):
     po = ""
     vendor = 0
     vendor_name: Optional[str] = None
+    force_send = False
 
     try:
-        po, vendor = get_sqi_args()
-        logging.info(f"SQI args: PO={po} Vendor={vendor}")
+        po, vendor, force_send = get_sqi_args()
+        logging.info(f"SQI args: PO={po} Vendor={vendor} Force={force_send}")
 
         ui("INFO", f"Starting Maceri Push v{APP_VERSION}", "")
-        ui("INFO", "SQI Parameters", f"PO={po} | Vendor={vendor}")
+        ui("INFO", "SQI Parameters", f"PO={po} | Vendor={vendor} | Force={force_send}")
         ui("INFO", "Loading config.ini...", os.path.basename(CONFIG_PATH))
 
         ui("INFO", "Connecting to SQL...", f"{server_name} / {database}")
@@ -883,6 +898,36 @@ def worker(ui_q: Queue):
         rec_hdr_f91 = get_rec_hdr_f91(conn, str(po))
         logging.info(f"Vendor lookup: F27={vendor} => VendorName={vendor_name!r}")
         logging.info(f"REC_HDR lookup: PO={po} => F91={rec_hdr_f91!r}")
+
+        # ---------------------------------------------------------------------
+        # NEW: Don't send the same PO twice (unless --force)
+        # ---------------------------------------------------------------------
+        if not force_send:
+            if is_po_already_sent(conn, str(po), SENT_MARKER):
+                f1254 = get_rec_hdr_f1254(conn, str(po))
+                msg = f"PO {po} already marked as sent ({SENT_MARKER}). Not sending again."
+                detail = f"REC_HDR.F1254={f1254!r}"
+                ui("WARN", msg, detail)
+                logging.warning(f"{msg} {detail}")
+
+                # Log a WARN row so you can see it in RAVYX_PO_STATUS
+                try:
+                    insert_ravyx_po_status(
+                        conn,
+                        po_number=str(po),
+                        vendor=vendor,
+                        vendor_name=vendor_name,
+                        status="WARN",
+                        f1081_text=msg,
+                        dept=None,
+                        rec_hdr_f91=rec_hdr_f91,
+                        process="Order Export",
+                    )
+                except Exception as e2:
+                    logging.warning(f"PO {po}: unable to insert RAVYX_PO_STATUS (WARN already-sent): {e2}")
+
+                ui("DONE", "Skipped", f"Auto-close in {AUTO_CLOSE_SECONDS}s.")
+                return
 
         _validate_maceri_config()
 
@@ -913,7 +958,6 @@ def worker(ui_q: Queue):
         ui("INFO", f"Processing PO {po}", "")
         invalid_retry = 0
 
-        # Accumulate skipped UPCs across validation + API invalid items
         all_skips: Dict[str, Set[str]] = {}
 
         while True:
@@ -922,8 +966,6 @@ def worker(ui_q: Queue):
 
             payload, _valid, _skipped, skip_map = build_json_payload(po_rows, po)
             merge_skip_maps(all_skips, skip_map)
-
-            # remove redundant "Missing ITEMCODE" UPCs when same UPC is already flagged as "Item not found"
             _remove_missing_itemcode_dupes(all_skips)
 
             if not payload:
@@ -1000,21 +1042,16 @@ def worker(ui_q: Queue):
                 invalid = _extract_item_not_found(detail_text)
 
                 if invalid:
-                    item_code, _uom = invalid  # ignore UOM in displayed text
+                    item_code, _uom = invalid
                     invalid_retry += 1
 
-                    # Find UPCs BEFORE deleting the REC_REG lines 
                     upcs_before_delete = _find_upcs_for_itemcode(po_rows, item_code)
-
-                    # Desired message (no UOM):
                     reason = _format_item_not_found_reason(item_code)
 
-                    # Add to final summary map 
                     if upcs_before_delete:
                         for u in upcs_before_delete:
                             add_skip(all_skips, reason, u)
                     else:
-                        # UPC not available (or already deleted) -> still show reason
                         add_skip(all_skips, reason, "")
 
                     deleted = delete_invalid_item_from_po(conn, str(po), item_code)
@@ -1044,7 +1081,6 @@ def worker(ui_q: Queue):
                         force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
                         break
 
-                    # loop again with cleaned PO (REC_REG deleted) 
                     continue
 
                 msg = f"Order was NOT sent. Maceri error: {detail_text}"

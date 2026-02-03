@@ -7,6 +7,7 @@
 # 4) Purge RAVYX_PO_STATUS is skipped with friendly message if table not accessible.
 # 5) Avoid writing RUN FAILED row to RAVYX_PO_STATUS when DB isn't usable.
 # 6) Avoid misleading status in finally when DB never opened.
+# 7) IMPORTANT: If Upshop returns 0 approved orders -> DO NOT write a "blank" SUCCESS row to RAVYX_PO_STATUS.
 
 import os
 import sys
@@ -776,7 +777,7 @@ def run_import():
         if not auth_token:
             msg = "Upshop /login response has no access_token"
             ui_error("Auth token missing", msg)
-           
+
             try:
                 upsert_po_status(
                     conn,
@@ -803,22 +804,12 @@ def run_import():
         data_items = job_status.get("data", [])
         status("Download complete.", f"{len(data_items)} item(s)")
 
+        # ---------------------------------------------------------------------
+        # FIX: If 0 approved orders, do NOT write a "blank" SUCCESS row to RAVYX_PO_STATUS
+        # ---------------------------------------------------------------------
         if not data_items:
             totals["items_seen"] = 0
             status("No approved orders found.", "0 order / 0 item.")
-            try:
-                upsert_po_status(
-                    conn,
-                    f91=RUN_ID,
-                    f27="0",
-                    step="Order Import",
-                    status_txt="SUCCESS",
-                    message="No approved orders found",
-                    dept=None,
-                    f1032=0,
-                )
-            except Exception:
-                pass
             return totals
 
         # Build unique order list (by PO + Vendor)
