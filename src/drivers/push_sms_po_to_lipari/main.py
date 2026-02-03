@@ -1,4 +1,5 @@
 
+
 import os
 import sys
 import csv
@@ -118,7 +119,7 @@ def setup_logging(ui_q: Optional["queue.Queue"] = None) -> None:
 
 
 # =============================================================================
-# Logs purge
+# Logs purge (ONLY the main log now)
 # =============================================================================
 def purge_logs(log_dir: str, days_to_keep: int) -> int:
     if not days_to_keep or days_to_keep <= 0:
@@ -130,11 +131,11 @@ def purge_logs(log_dir: str, days_to_keep: int) -> int:
     if not p.exists():
         return 0
 
+    # Only main logs (we merged everything)
     patterns = [
         "pushSMSPOtoLipari_logs_*.log",
-        "Lipari_baditem_*.log",
-        "Lipari_error_*.log",
-        "Lipari_payload_*.csv",
+        # If you ever generate "payload" csv logs again, add it here.
+        # "Lipari_payload_*.csv",
     ]
 
     for pat in patterns:
@@ -192,36 +193,32 @@ connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={dat
 
 
 # =============================================================================
-# Small log files
+# Helpers (no more extra log files)
 # =============================================================================
-def log_bad_item(po_number: str, row: Any, reason: str) -> None:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(LOG_DIR, f"Lipari_baditem_{ts}.log")
-    try:
-        with open(path, "a", encoding="utf-8") as f:
-            upc = getattr(row, "PlumItemCode", "") or ""
-            item = getattr(row, "LipariItemCode", "") or ""
-            qty = getattr(row, "Quantity", "") or ""
-            price = getattr(row, "Price", "") or ""
-            f.write(f"PO={po_number} Reason={reason}\nUPC={upc} LipariItemCode={item} QTY={qty} Price={price}\n\n")
-    except Exception:
-        pass
-    logging.warning(f"PO {po_number}: Skipped line UPC={getattr(row,'PlumItemCode','?')} — {reason}")
+def _safe_str(x: Any) -> str:
+    return ("" if x is None else str(x)).strip()
 
 
-def log_error_file(po_number: str, msg: str) -> str:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(LOG_DIR, f"Lipari_error_PO{po_number}_{ts}.log")
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(msg or "")
-    except Exception:
-        pass
-    return path
+def log_bad_item(po_number: str, row: Any, reason: str) -> str:
+    """
+    Logs a skipped item into the MAIN log only,
+    and returns a short string usable for RAVYX_PO_STATUS.F1081.
+    """
+    upc = _safe_str(getattr(row, "PlumItemCode", ""))
+    item = _safe_str(getattr(row, "LipariItemCode", ""))
+    qty = _safe_str(getattr(row, "Quantity", ""))
+    price = _safe_str(getattr(row, "Price", ""))
+
+    logging.warning(
+        f"PO {po_number}: Skipped line | Reason={reason} | UPC={upc or '?'} | "
+        f"LipariItemCode={item or '?'} | QTY={qty or '?'} | Price={price or '?'}"
+    )
+
+    return f"UPC={upc or '?'} | LipariItemCode={item or '?'} | Reason={reason}"
 
 
 # =============================================================================
-# RAVYX_PO_STATUS helpers (same behavior as UNFI re: F91)
+# RAVYX_PO_STATUS helpers
 # =============================================================================
 F1081_MAX_LEN = 5000
 
@@ -285,6 +282,7 @@ def insert_ravyx_po_status(
     f1081_val = _truncate_5000(f1081_text or "") or None
     vname = (vendor_name or "").strip() or None
 
+    # Keep real REC_HDR.F91 only on SUCCESS/WARN; otherwise runid.
     use_hdr_f91 = (process == "Order Export" and status in ("SUCCESS", "WARN") and (rec_hdr_f91 or "").strip())
     f91_value = (rec_hdr_f91.strip() if use_hdr_f91 else runid)
 
@@ -349,6 +347,7 @@ def get_po_rows(conn: pyodbc.Connection, po_number: str):
         FROM [dbo].[REC_REG] REG
         JOIN [dbo].[REC_HDR] HDR ON REG.F1032 = HDR.F1032
         WHERE REG.F1032 = ?
+        ORDER BY REG.F01
     """
     cur = conn.cursor()
     cur.execute(q, (LIPARI_STORE_NUMBER_CONST, po_number))
@@ -394,6 +393,26 @@ def get_dept_for_upc(conn: pyodbc.Connection, upc: str) -> Optional[str]:
     return dept or None
 
 
+def get_first_dept_from_order(conn: pyodbc.Connection, po_rows) -> Optional[int]:
+    try:
+        if not po_rows:
+            return None
+        upc = str(getattr(po_rows[0], "PlumItemCode", "") or "").strip()
+        if not upc:
+            return None
+
+        d = get_dept_for_upc(conn, upc)
+        if not d:
+            return None
+
+        d = d.strip()
+        if not d.isdigit():
+            return None
+        return int(d)
+    except Exception:
+        return None
+
+
 def map_store_number_from_upc(conn: pyodbc.Connection, upc: str) -> str:
     dept = get_dept_for_upc(conn, upc)
     if not dept:
@@ -412,33 +431,45 @@ def map_store_number_from_upc(conn: pyodbc.Connection, upc: str) -> str:
 # =============================================================================
 # Payload builder
 # =============================================================================
-def build_csv_payload(conn: pyodbc.Connection, po_rows, po_number: str) -> Tuple[Optional[List[List[Any]]], int, int]:
+def build_csv_payload(
+    conn: pyodbc.Connection,
+    po_rows,
+    po_number: str
+) -> Tuple[Optional[List[List[Any]]], int, int, List[str]]:
+    """
+    Returns:
+      payload (or None),
+      valid_lines,
+      skipped_lines,
+      skipped_details[]  (strings to include in RAVYX_PO_STATUS.F1081)
+    """
     logging.info(f"PO {po_number}: CSV build start ...")
 
     if not po_rows:
         logging.info(f"PO {po_number}: CSV build end — no rows.")
-        return None, 0, 0
+        return None, 0, 0, []
 
     payload: List[List[Any]] = []
     valid = 0
     skipped = 0
+    skipped_details: List[str] = []
 
     for row in po_rows:
         if row.LipariItemCode is None or str(row.LipariItemCode).strip() == "":
             skipped += 1
-            log_bad_item(po_number, row, "Missing LipariItemCode")
+            skipped_details.append(log_bad_item(po_number, row, "Missing LipariItemCode"))
             continue
 
         try:
             qty_int = int(row.Quantity)
         except Exception:
             skipped += 1
-            log_bad_item(po_number, row, "Invalid Quantity (non-integer)")
+            skipped_details.append(log_bad_item(po_number, row, "Invalid Quantity (non-integer)"))
             continue
 
         if qty_int <= 0:
             skipped += 1
-            log_bad_item(po_number, row, "Invalid Quantity (<=0)")
+            skipped_details.append(log_bad_item(po_number, row, "Invalid Quantity (<=0)"))
             continue
 
         store_num_mapped = map_store_number_from_upc(conn, str(row.PlumItemCode))
@@ -459,7 +490,30 @@ def build_csv_payload(conn: pyodbc.Connection, po_rows, po_number: str) -> Tuple
 
     logging.info(f"PO {po_number}: Payload summary — ValidLines={valid} SkippedLines={skipped}")
     logging.info(f"PO {po_number}: CSV build end.")
-    return (payload if payload else None), valid, skipped
+    return (payload if payload else None), valid, skipped, skipped_details
+
+
+def _format_skipped_for_f1081(skipped_details: List[str], max_chars: int = 2000) -> str:
+    """
+    Create a compact 'SkippedItems:' section for F1081.
+    """
+    if not skipped_details:
+        return ""
+
+    parts = []
+    total = 0
+    for s in skipped_details:
+        s = (s or "").strip()
+        if not s:
+            continue
+        add = ("; " if parts else "") + s
+        if total + len(add) > max_chars:
+            parts.append("... (more skipped items)")
+            break
+        parts.append(s)
+        total += len(add)
+
+    return " | SkippedItems: " + "; ".join(parts)
 
 
 # =============================================================================
@@ -470,10 +524,6 @@ def _safe_makedirs(p: str) -> None:
 
 
 def backup_csv(payload: List[List[Any]], po_number: str) -> str:
-    """
-    Always writes a backup CSV under CSV_BACKUP_DIR. Never deleted.
-    Returns full path to backup file.
-    """
     _safe_makedirs(CSV_BACKUP_DIR)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{po_number}_{ts}.csv"
@@ -499,9 +549,6 @@ def test_share_connection(share_path: str) -> Tuple[bool, str]:
 
 
 def copy_backup_to_share(backup_path: str, po_number: str) -> str:
-    """
-    Copies the already-backed-up file to the destination share.
-    """
     filename = os.path.basename(backup_path)
     dest_path = os.path.join(DEST_SHARE, filename)
 
@@ -512,6 +559,24 @@ def copy_backup_to_share(backup_path: str, po_number: str) -> str:
     shutil.copy2(backup_path, dest_path)
     logging.info(f"PO {po_number}: CSV copied to share successfully. DestPath='{dest_path}'")
     return dest_path
+
+
+def _is_share_unreachable_error(ex: Exception) -> bool:
+    msg = str(ex) or ""
+    needles = [
+        "Share not accessible",
+        "Share path is empty",
+        "not a directory",
+        "The network path was not found",
+        "The specified network name is no longer available",
+        "Access is denied",
+        "Permission denied",
+        "WinError 53",
+        "WinError 67",
+        "WinError 5",
+        "WinError 64",
+    ]
+    return any(n.lower() in msg.lower() for n in needles)
 
 
 # =============================================================================
@@ -560,7 +625,6 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
         except Exception as e:
             logging.warning(f"Log purge failed: {e}")
 
-        # Ensure UI gets something immediately (helps confirm UI is alive)
         ui_summary("INFO", "Starting Lipari export…")
         ui_counters(sent=0, warns=0, errs=0)
 
@@ -587,10 +651,13 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
 
             vendor_name = get_vendor_name(conn, vendor_arg) if vendor_arg else None
             rec_hdr_f91 = get_rec_hdr_f91(conn, str(po))
-            dept = None  # keep NULL for now
 
             po_rows = get_po_rows(conn, po)
-            payload, v_count, s_count = build_csv_payload(conn, po_rows, po)
+
+            dept = get_first_dept_from_order(conn, po_rows)
+            logging.info(f"PO {po}: Dept(F03) resolved from first REC_REG line: {dept!r}")
+
+            payload, v_count, s_count, skipped_details = build_csv_payload(conn, po_rows, po)
 
             totals["valid_lines"] += v_count
             totals["skipped_lines"] += s_count
@@ -602,6 +669,8 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 logging.warning(msg)
                 ui_summary("WARN", msg)
 
+                f1081 = msg + _format_skipped_for_f1081(skipped_details)
+
                 try:
                     insert_ravyx_po_status(
                         conn,
@@ -609,7 +678,7 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                         vendor=vendor_arg or 0,
                         vendor_name=vendor_name,
                         status="FAILED",
-                        f1081_text=msg,
+                        f1081_text=f1081,
                         dept=dept,
                         rec_hdr_f91=rec_hdr_f91,
                         process="Order Export",
@@ -633,9 +702,9 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 ui_counters(sent=totals["sent_pos"], warns=totals["skipped_lines"], errs=totals["errors"])
 
                 final_status = "WARN" if s_count > 0 else "SUCCESS"
+
                 final_msg = f"Sent OK. Dest={dest_path} | Backup={backup_path}"
-                if s_count > 0:
-                    final_msg += f" | SkippedLines={s_count}"
+                final_msg += _format_skipped_for_f1081(skipped_details)
 
                 try:
                     insert_ravyx_po_status(
@@ -661,11 +730,20 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 totals["errors"] += 1
                 force_keep_po_open(conn, po)
 
-                err_text = _truncate_5000(
-                    f"Failed to send PO {po}: {type(e).__name__}: {e} | Backup={backup_path or 'N/A'}"
+                # Keep FULL detail in the main log only
+                logging.exception(
+                    f"PO {po}: send failed. {type(e).__name__}: {e} | Backup={backup_path or 'N/A'}"
                 )
-                err_path = log_error_file(po, err_text)
-                logging.exception(f"PO {po}: send failed. ErrorLog={err_path}")
+
+                # Short message for RAVYX_PO_STATUS if share unreachable
+                if _is_share_unreachable_error(e):
+                    f1081_short = "Shared Folder Unreachable"
+                    ui_msg = "Shared Folder Unreachable"
+                else:
+                    f1081_short = _truncate_5000(f"{type(e).__name__}: {e}")
+                    ui_msg = f"{type(e).__name__}: {e}"
+
+                f1081_final = f1081_short + _format_skipped_for_f1081(skipped_details)
 
                 try:
                     insert_ravyx_po_status(
@@ -674,7 +752,7 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                         vendor=vendor_arg or 0,
                         vendor_name=vendor_name,
                         status="FAILED",
-                        f1081_text=err_text,
+                        f1081_text=f1081_final,
                         dept=dept,
                         rec_hdr_f91=rec_hdr_f91,
                         process="Order Export",
@@ -682,7 +760,7 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 except Exception as e2:
                     logging.warning(f"PO {po}: unable to insert RAVYX_PO_STATUS (FAILED): {e2}")
 
-                ui_summary("ERROR", f"Share error: {type(e).__name__}: {e}")
+                ui_summary("ERROR", f"Share error: {ui_msg}")
                 ui_counters(sent=totals["sent_pos"], warns=totals["skipped_lines"], errs=totals["errors"])
 
         dur = round(time.perf_counter() - start, 2)
@@ -713,22 +791,13 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
 
 
 # =============================================================================
-# UI wrapper (FIXED FOR PYINSTALLER)
+# UI wrapper (PyInstaller-friendly)
 # =============================================================================
 def _import_vendor_ui():
-    """
-    Import VendorSendUI in a PyInstaller-friendly way.
-    Key fixes:
-      - NO __import__ dynamic loop (PyInstaller can miss it)
-      - tries local folder first, then package path
-      - returns (VendorSendUI, error_text)
-    """
     try:
-        # Most common: ui_send_PO_Lipari.py sits next to main.py
         from ui_send_PO_Lipari import VendorSendUI  # type: ignore
         return VendorSendUI, None
     except Exception as e1:
-        # If your project structure is packaged (adjust if needed)
         try:
             from drivers.push_sms_po_to_lipari.ui_send_PO_Lipari import VendorSendUI  # type: ignore
             return VendorSendUI, None
@@ -740,7 +809,6 @@ def main_with_ui() -> int:
     ui_q: "queue.Queue" = queue.Queue()
     setup_logging(ui_q=ui_q)
 
-    # Emit something immediately so even if worker fails fast, UI shows it
     ui_q.put(("SUMMARY", "INFO", "Launching UI…"))
 
     VendorSendUI, err = _import_vendor_ui()
@@ -756,7 +824,6 @@ def main_with_ui() -> int:
 
     def worker():
         try:
-            # Make sure UI gets alive confirmation
             ui_q.put(("SUMMARY", "INFO", "UI started. Processing…"))
             rc = run_job(ui_q=ui_q)
             if rc == 0:
@@ -781,14 +848,10 @@ def wants_ui() -> bool:
         return False
     if "--ui" in args:
         return True
-    # Default: UI when frozen EXE, console when running as script
     return _is_frozen()
 
 
 if __name__ == "__main__":
-    # IMPORTANT FIX:
-    # Previously you were always calling run_job(ui_q=None) in __main__,
-    # which guarantees NO UI. This entrypoint now correctly launches UI in EXE.
     if wants_ui():
         raise SystemExit(main_with_ui())
 

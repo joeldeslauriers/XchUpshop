@@ -17,11 +17,11 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', 'Ravyx'),
             StringStruct('LegalCopyright', 'Tous droits réservés © Ravyx'),
-            StringStruct('FileDescription', 'Export SMS order to UNFI'),
+            StringStruct('FileDescription', 'Export SMS to Lipari'),
             StringStruct('FileVersion', '0.0.0.1'),
-            StringStruct('InternalName', 'PushSMSPOToUNFI'),
-            StringStruct('OriginalFilename', 'PushSMSPOToUNFI.exe'),
-            StringStruct('ProductName', 'PushSMSPOToUNFI'),
+            StringStruct('InternalName', 'PushSMSPOToLipari'),
+            StringStruct('OriginalFilename', 'PushSMSPOToLipari.exe'),
+            StringStruct('ProductName', 'PushSMSPOToLipari'),
             StringStruct('ProductVersion', '0.0.0.1'),
           ]
         )
