@@ -31,7 +31,7 @@ object ppReport1: TppReport
   DataPipelineName = 'MASTER'
   object ppHeaderBand1: TppHeaderBand
     mmBottomOffset = 0
-    mmHeight = 32279
+    mmHeight = 36513
     mmPrintPosition = 0
     object ppLineHeader: TppLine
       UserName = 'ppLineHeader'
@@ -212,7 +212,7 @@ object ppReport1: TppReport
   object ppDetailBand1: TppDetailBand
     PrintHeight = phDynamic
     mmBottomOffset = 0
-    mmHeight = 4498
+    mmHeight = 8996
     mmPrintPosition = 0
     object ppDBTextDate: TppDBText
       UserName = 'ppDBTextDate'
@@ -246,10 +246,10 @@ object ppReport1: TppReport
       Font.Style = []
       Transparent = True
       DataPipelineName = 'MASTER'
-      mmHeight = 3704
+      mmHeight = 3598
       mmLeft = 22754
       mmTop = 0
-      mmWidth = 10583
+      mmWidth = 10668
       BandType = 4
     end
     object ppDBTextPO: TppDBText
@@ -268,7 +268,7 @@ object ppReport1: TppReport
       mmHeight = 3598
       mmLeft = 35983
       mmTop = 0
-      mmWidth = 21336
+      mmWidth = 7112
       BandType = 4
     end
     object ppDBTextVendor: TppDBText
@@ -305,7 +305,7 @@ object ppReport1: TppReport
       mmHeight = 3260
       mmLeft = 72496
       mmTop = 0
-      mmWidth = 19812
+      mmWidth = 15579
       BandType = 4
     end
     object ppDBTextProcess: TppDBText
@@ -369,13 +369,13 @@ object ppReport1: TppReport
       Font.Charset = DEFAULT_CHARSET
       Font.Color = clBlack
       Font.Name = 'Arial'
-      Font.Size = 6
+      Font.Size = 5
       Font.Style = []
       Transparent = True
       WordWrap = True
       DataPipelineName = 'MASTER'
-      mmHeight = 3969
-      mmLeft = 136790
+      mmHeight = 13000
+      mmLeft = 135732
       mmTop = 0
       mmWidth = 65881
       BandType = 4
@@ -390,8 +390,8 @@ object ppReport1: TppReport
       Pen.Width = 3
       Weight = 2.25
       mmHeight = 3969
-      mmLeft = 0
-      mmTop = 794
+      mmLeft = 1588
+      mmTop = 1852
       mmWidth = 203200
       BandType = 8
     end

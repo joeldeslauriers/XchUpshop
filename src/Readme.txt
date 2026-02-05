@@ -10,7 +10,6 @@ pyinstaller --noconfirm --clean --onefile --windowed `
 
 
 
-
 cd C:\XchUpshop
 
 pyinstaller --noconfirm --clean --onefile --windowed `
@@ -36,3 +35,12 @@ pyinstaller --noconfirm --clean --onefile --windowed `
   --add-data "src\drivers\push_sms_po_to_lipari\config.ini;." `
   --add-data "src\drivers\push_sms_po_to_lipari\version_info.txt;." `
   src\drivers\push_sms_po_to_lipari\main.py
+
+
+pyinstaller --noconfirm --clean --onefile --windowed `
+  --name GetSPSInvoices `
+  --paths src `
+  --hidden-import ui_getSPSInvoices `
+  --add-data "src\drivers\get_sps_invoices\config.ini;." `
+  --add-data "src\drivers\get_sps_invoices\version_info.txt;." `
+  src\drivers\get_sps_invoices\main.py

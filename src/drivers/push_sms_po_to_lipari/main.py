@@ -44,7 +44,7 @@ APP_VERSION = read_version()
 
 
 # =============================================================================
-# Args from SQI (optional)
+# Args from SQI 
 # =============================================================================
 def _strip_quotes(s: str) -> str:
     return (s or "").strip().strip('"').strip("'")
@@ -117,7 +117,7 @@ def setup_logging(ui_q: Optional["queue.Queue"] = None) -> None:
 
 
 # =============================================================================
-# Logs purge (ONLY the main log now)
+# Logs purge 
 # =============================================================================
 def purge_logs(log_dir: str, days_to_keep: int) -> int:
     if not days_to_keep or days_to_keep <= 0:
@@ -187,13 +187,13 @@ if "Lipari_Departments" in config:
 connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database};Trusted_Connection=yes"
 
 # =============================================================================
-# NEW: Lipari marker in REC_HDR.F1254
+# Lipari marker in REC_HDR.F1254
 # =============================================================================
 LIPARI_SENT_MARKER = "SENT_LIPARI"
 
 
 # =============================================================================
-# Helpers (no more extra log files)
+# Helpers 
 # =============================================================================
 def _safe_str(x: Any) -> str:
     return ("" if x is None else str(x)).strip()
@@ -551,7 +551,7 @@ def _format_skipped_for_f1081(skipped_details: List[str], max_chars: int = 2000)
 
 
 # =============================================================================
-# File helpers (always backup)
+# File helpers 
 # =============================================================================
 def _safe_makedirs(p: str) -> None:
     os.makedirs(p, exist_ok=True)

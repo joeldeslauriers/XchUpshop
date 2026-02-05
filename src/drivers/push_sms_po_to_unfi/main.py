@@ -173,6 +173,7 @@ server_name = config["Settings"]["ServerName"]
 sql_driver = config["Settings"].get("SQLDriver", "SQL Server")
 database = config["Settings"].get("DatabaseName", "STORESQL")
 
+# IMPORTANT: this is the SMS StoreNumber (ex: 3) and MUST be used in the URL query param storeId
 store_number_sms = int(config["Settings"].get("StoreNumber", "0"))
 connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database};Trusted_Connection=yes"
 
@@ -211,7 +212,11 @@ if (
     raise RuntimeError("Missing config.ini value(s): " + ", ".join(missing))
 
 if store_number_sms <= 0:
-    logging.warning("Config [Settings] StoreNumber is <= 0. Not used for UNFI storeId (uses vendor StoreID).")
+    # We can still build payload, but URL will be wrong; better to fail early.
+    raise RuntimeError(
+        "Config error: [Settings] StoreNumber must be > 0. "
+        "UNFI URL requires ?storeId=<StoreNumber> (ex: 3)."
+    )
 
 
 # Second validation to not export order for other vendor than UNFI
@@ -240,15 +245,22 @@ def read_vendor_cfg(vendor_id: int) -> Dict[str, str]:
         "SupplierId": config[sect].get("SupplierId", str(vendor_id)).strip(),
         "SupplierName": config[sect]["SupplierName"].strip(),
         "AccountNumber": config[sect]["AccountNumber"].strip(),
-        "StoreID": store_id_raw,
+        "StoreID": store_id_raw,  # UNFI storeID (ex: 127705) -> goes INSIDE payload header.storeID
         "Section": sect,
     }
 
 
 def build_unfi_order_url(vendor_cfg: Dict[str, str]) -> str:
+    """
+    Match PROD :
+      POST https://posapi.geniuscentral.com/stores/{chainId}/orders?storeId={StoreNumber}
+    where:
+      - chainId comes from [UNFI] ApiStoreChainId (ex: 142139)
+      - storeId querystring is SMS StoreNumber (ex: 3)
+      - payload header.storeID remains the UNFI StoreID (ex: 127705)
+    """
     chain_id = int(UNFI_CHAIN_ID)
-    unfi_store_id = int(vendor_cfg["StoreID"])
-    return f"{UNFI_API_BASE}/stores/{chain_id}/orders?storeId={unfi_store_id}"
+    return f"{UNFI_API_BASE}/stores/{chain_id}/orders?storeId={int(store_number_sms)}"
 
 
 # =============================================================================
@@ -793,6 +805,7 @@ def build_unfi_payload(
 
     used_total = rec_ttl_total if rec_ttl_total is not None else fallback_total
 
+    # UNFI storeID (ex: 127705) must remain INSIDE payload header.storeID
     unfi_store_id = int(vendor_cfg["StoreID"])
 
     payload = {
@@ -966,6 +979,13 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
 
         vendor_cfg = read_vendor_cfg(vendor)
         order_url = build_unfi_order_url(vendor_cfg)
+
+        # log clearly what URL we will POST to
+        logging.info(
+            f"UNFI endpoint (POST) = {order_url} | "
+            f"storeId(query)=StoreNumber={store_number_sms} | "
+            f"payload header.storeID(UNFI)={vendor_cfg['StoreID']}"
+        )
 
         conn = pyodbc.connect(connection_string)
         vendor_name = get_vendor_name(conn, vendor)

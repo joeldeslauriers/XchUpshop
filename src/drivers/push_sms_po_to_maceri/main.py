@@ -900,7 +900,7 @@ def worker(ui_q: Queue):
         logging.info(f"REC_HDR lookup: PO={po} => F91={rec_hdr_f91!r}")
 
         # ---------------------------------------------------------------------
-        # NEW: Don't send the same PO twice (unless --force)
+        #  Don't send the same PO twice 
         # ---------------------------------------------------------------------
         if not force_send:
             if is_po_already_sent(conn, str(po), SENT_MARKER):
@@ -910,7 +910,7 @@ def worker(ui_q: Queue):
                 ui("WARN", msg, detail)
                 logging.warning(f"{msg} {detail}")
 
-                # Log a WARN row so you can see it in RAVYX_PO_STATUS
+                # Log a WARN 
                 try:
                     insert_ravyx_po_status(
                         conn,
