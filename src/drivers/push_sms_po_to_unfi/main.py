@@ -30,7 +30,25 @@ def _base_dir() -> str:
 
 
 BASE_DIR = _base_dir()
-CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
+
+
+def find_config_path() -> str:
+    """
+    Look for config.ini:
+      1) next to EXE/script (BASE_DIR)
+      2) one folder above BASE_DIR -> shared config.ini
+    """
+    candidates = [
+        os.path.join(BASE_DIR, "config.ini"),
+        os.path.join(os.path.dirname(BASE_DIR), "config.ini"),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return candidates[-1]
+
+
+CONFIG_PATH = find_config_path()
 VERSION_PATH = os.path.join(BASE_DIR, "version_info.txt")
 
 
@@ -163,18 +181,26 @@ def purge_logs(log_dir: str, days_to_keep: int) -> int:
 # =============================================================================
 config = configparser.ConfigParser()
 if not os.path.exists(CONFIG_PATH):
-    raise FileNotFoundError(f"config.ini not found next to EXE/script: {CONFIG_PATH}")
+    raise FileNotFoundError(f"config.ini not found: {CONFIG_PATH}")
 
 config.read(CONFIG_PATH, encoding="utf-8")
 
-LOG_PURGE_DAYS = config["Settings"].getint("LogPurge", fallback=30)
+LOG_PURGE_DAYS = config.getint("Settings", "LogPurge", fallback=30)
 
-server_name = config["Settings"]["ServerName"]
-sql_driver = config["Settings"].get("SQLDriver", "SQL Server")
-database = config["Settings"].get("DatabaseName", "STORESQL")
+server_name = (config.get("Settings", "ServerName", fallback="") or "").strip()
+if not server_name:
+    raise RuntimeError("Missing config.ini value: [Settings] ServerName")
 
-# IMPORTANT: this is the SMS StoreNumber (ex: 3) and MUST be used in the URL query param storeId
-store_number_sms = int(config["Settings"].get("StoreNumber", "0"))
+sql_driver = (config.get("Settings", "SQLDriver", fallback="SQL Server") or "SQL Server").strip()
+database = (config.get("Settings", "DatabaseName", fallback="STORESQL") or "STORESQL").strip()
+
+store_number_sms = int((config.get("Settings", "StoreNumber", fallback="0") or "0").strip() or "0")
+if store_number_sms <= 0:
+    raise RuntimeError(
+        "Config error: [Settings] StoreNumber must be > 0. "
+        "UNFI URL requires ?storeId=<StoreNumber> (ex: 3)."
+    )
+
 connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database};Trusted_Connection=yes"
 
 # UNFI shared settings
@@ -188,35 +214,22 @@ UNFI_CLIENT_ID = config.get("UNFI", "ClientId", fallback="").strip()
 TIMEOUT_AUTH_SEC = config.getint("UNFI", "TimeoutAuthSec", fallback=90)
 TIMEOUT_POST_SEC = config.getint("UNFI", "TimeoutPostSec", fallback=120)
 
-if (
-    not UNFI_AUTH_URL
-    or not UNFI_API_BASE
-    or not UNFI_USERNAME
-    or not UNFI_PASSWORD
-    or not UNFI_CLIENT_ID
-    or not UNFI_CHAIN_ID
-):
-    missing = []
-    if not UNFI_AUTH_URL:
-        missing.append("[UNFI] AuthUrl")
-    if not UNFI_API_BASE:
-        missing.append("[UNFI] ApiBaseUrl")
-    if not UNFI_CHAIN_ID:
-        missing.append("[UNFI] ApiStoreChainId")
-    if not UNFI_USERNAME:
-        missing.append("[UNFI] Username")
-    if not UNFI_PASSWORD:
-        missing.append("[UNFI] Password")
-    if not UNFI_CLIENT_ID:
-        missing.append("[UNFI] ClientId")
-    raise RuntimeError("Missing config.ini value(s): " + ", ".join(missing))
+missing = []
+if not UNFI_AUTH_URL:
+    missing.append("[UNFI] AuthUrl")
+if not UNFI_API_BASE:
+    missing.append("[UNFI] ApiBaseUrl")
+if not UNFI_CHAIN_ID:
+    missing.append("[UNFI] ApiStoreChainId")
+if not UNFI_USERNAME:
+    missing.append("[UNFI] Username")
+if not UNFI_PASSWORD:
+    missing.append("[UNFI] Password")
+if not UNFI_CLIENT_ID:
+    missing.append("[UNFI] ClientId")
 
-if store_number_sms <= 0:
-    # We can still build payload, but URL will be wrong; better to fail early.
-    raise RuntimeError(
-        "Config error: [Settings] StoreNumber must be > 0. "
-        "UNFI URL requires ?storeId=<StoreNumber> (ex: 3)."
-    )
+if missing:
+    raise RuntimeError("Missing config.ini value(s): " + ", ".join(missing))
 
 
 # Second validation to not export order for other vendor than UNFI
@@ -234,30 +247,25 @@ def read_vendor_cfg(vendor_id: int) -> Dict[str, str]:
         raise RuntimeError(f"Missing config.ini section: [{sect}] for vendor {vendor_id}")
 
     for k in ("SupplierName", "AccountNumber", "StoreID"):
-        if not config[sect].get(k, "").strip():
+        if not (config[sect].get(k, "") or "").strip():
             raise RuntimeError(f"Missing config.ini value: [{sect}] {k}")
 
-    store_id_raw = config[sect]["StoreID"].strip().strip('"')
+    store_id_raw = (config[sect]["StoreID"] or "").strip().strip('"')
     if not store_id_raw.isdigit():
         raise RuntimeError(f"Invalid config.ini value: [{sect}] StoreID must be numeric. Got: {store_id_raw!r}")
 
     return {
-        "SupplierId": config[sect].get("SupplierId", str(vendor_id)).strip(),
+        "SupplierId": (config[sect].get("SupplierId", str(vendor_id)) or str(vendor_id)).strip(),
         "SupplierName": config[sect]["SupplierName"].strip(),
         "AccountNumber": config[sect]["AccountNumber"].strip(),
-        "StoreID": store_id_raw,  # UNFI storeID (ex: 127705) -> goes INSIDE payload header.storeID
+        "StoreID": store_id_raw,  # UNFI storeID inside payload header.storeID
         "Section": sect,
     }
 
 
 def build_unfi_order_url(vendor_cfg: Dict[str, str]) -> str:
     """
-    Match PROD :
-      POST https://posapi.geniuscentral.com/stores/{chainId}/orders?storeId={StoreNumber}
-    where:
-      - chainId comes from [UNFI] ApiStoreChainId (ex: 142139)
-      - storeId querystring is SMS StoreNumber (ex: 3)
-      - payload header.storeID remains the UNFI StoreID (ex: 127705)
+    POST https://posapi.../stores/{chainId}/orders?storeId={SMS StoreNumber}
     """
     chain_id = int(UNFI_CHAIN_ID)
     return f"{UNFI_API_BASE}/stores/{chain_id}/orders?storeId={int(store_number_sms)}"
@@ -356,7 +364,7 @@ def _write_unfi_api_log(
 
 
 # =============================================================================
-# Clear error messages - IMPROVED for HTTPError 5xx (502/503/504)
+# Clear error messages
 # =============================================================================
 def format_requests_error(e: Exception, url: str = "") -> Tuple[str, str]:
     raw = str(e) or repr(e)
@@ -440,24 +448,6 @@ def format_requests_error(e: Exception, url: str = "") -> Tuple[str, str]:
             f"Details: {raw}",
         )
 
-    if "unauthorized" in low:
-        return (
-            "Authentication failed (401)",
-            "Authentication was rejected.\n"
-            f"URL: {url}\n"
-            "Check Username/Password/ClientId in config.ini.\n\n"
-            f"Details: {raw}",
-        )
-
-    if "forbidden" in low:
-        return (
-            "Access forbidden (403)",
-            "Access denied by the server.\n"
-            f"URL: {url}\n"
-            "Check account permissions on UNFI/SPS side.\n\n"
-            f"Details: {raw}",
-        )
-
     return (
         "API communication error",
         f"Unable to communicate with the API.\nURL: {url}\n\nDetails: {raw}",
@@ -487,40 +477,28 @@ def get_rec_hdr_f91(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
         cur = conn.cursor()
         cur.execute("SELECT TOP 1 F91 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
         row = cur.fetchone()
-        if not row:
+        if not row or row[0] is None:
             return None
-        v = row[0]
-        if v is None:
-            return None
-        s = str(v).strip()
+        s = str(row[0]).strip()
         return s or None
     except Exception:
         return None
 
 
 def get_rec_hdr_f1254(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
-    """
-    Read REC_HDR.F1254 for this PO (UNFI GUID marker).
-    """
     try:
         cur = conn.cursor()
         cur.execute("SELECT TOP 1 F1254 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
         row = cur.fetchone()
-        if not row:
+        if not row or row[0] is None:
             return None
-        v = row[0]
-        if v is None:
-            return None
-        s = str(v).strip()
+        s = str(row[0]).strip()
         return s or None
     except Exception:
         return None
 
 
 def _looks_like_guid(value: Optional[str]) -> bool:
-    """
-    True if value parses as UUID.
-    """
     if not value:
         return False
     s = str(value).strip()
@@ -531,6 +509,18 @@ def _looks_like_guid(value: Optional[str]) -> bool:
         return True
     except Exception:
         return False
+
+
+def safe_has_existing_guid(conn: pyodbc.Connection, po_number: str) -> bool:
+    """
+    Fail-closed: if we cannot confirm, we treat as already-sent to avoid duplicates.
+    """
+    try:
+        v = get_rec_hdr_f1254(conn, po_number)
+        return bool(v and _looks_like_guid(v))
+    except Exception:
+        logging.warning(f"PO {po_number}: unable to read F1254; blocking resend for safety.")
+        return True
 
 
 def get_po_rows(conn: pyodbc.Connection, po_number: str):
@@ -687,31 +677,7 @@ def insert_ravyx_po_status(
     )
 
 
-def set_f1254_guid(conn: pyodbc.Connection, po_number: str, guid: str) -> None:
-    """
-    UNFI: After successful POST, store the GUID in REC_HDR.F1254.
-    """
-    guid = (guid or "").strip()
-    if not guid:
-        raise ValueError("GUID is empty; cannot write F1254.")
-
-    cur = conn.cursor()
-    cur.execute(
-        """
-        UPDATE [dbo].[REC_HDR]
-        SET F1254 = ?
-        WHERE F1032 = ?
-        """,
-        (guid, po_number),
-    )
-    conn.commit()
-
-
 def force_keep_po_open_on_failure(conn: pyodbc.Connection, po_number: str) -> None:
-    """
-    Ensure PO stays OPEN on any failure.
-    NOTE: We do NOT touch F1254 here. We only write GUID on success.
-    """
     cur = conn.cursor()
     cur.execute(
         """
@@ -725,10 +691,52 @@ def force_keep_po_open_on_failure(conn: pyodbc.Connection, po_number: str) -> No
     logging.warning(f"PO {po_number}: forced OPEN (failure path).")
 
 
-def set_po_closed(conn: pyodbc.Connection, po_number: str) -> None:
-    cur = conn.cursor()
-    cur.execute("UPDATE [dbo].[REC_HDR] SET F1067 = 'CLOSE' WHERE F1032 = ?", (po_number,))
-    conn.commit()
+def mark_po_sent_and_store_guid(conn: pyodbc.Connection, po_number: str, guid: str) -> None:
+    """
+    ATOMIC:
+      - REC_HDR.F1254 = <guid>
+      - REC_HDR.F1067 = 'CLOSE'
+    If anything fails => rollback + force OPEN.
+    """
+    guid = (guid or "").strip()
+    if not guid:
+        raise ValueError("GUID is empty; cannot write F1254.")
+
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+
+        cur.execute(
+            """
+            UPDATE [dbo].[REC_HDR]
+            SET F1254 = ?, F1067 = 'CLOSE'
+            WHERE F1032 = ?
+            """,
+            (guid, po_number),
+        )
+
+        conn.commit()
+        logging.info(f"PO {po_number}: stored GUID in F1254 and CLOSED (atomic).")
+
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+        logging.exception(f"PO {po_number}: failed to update REC_HDR (CLOSE+GUID): {type(e).__name__}: {e}")
+
+        try:
+            force_keep_po_open_on_failure(conn, po_number)
+        except Exception:
+            pass
+
+        raise
+    finally:
+        try:
+            conn.autocommit = True
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -766,21 +774,11 @@ def build_unfi_payload(
     vendor_cfg: Dict[str, str],
     po_rows,
 ) -> Tuple[Optional[Dict[str, Any]], str, int, int, str, Dict[str, List[str]]]:
-    """
-    Returns:
-      payload_or_none,
-      unique_order_id (GUID),
-      valid_count,
-      skipped_count,
-      total_msg,
-      skip_map(reason -> [upc,...])
-    """
     if not po_rows:
         return None, "", 0, 0, "No REC_REG rows found for this PO.", {}
 
     todays_date = datetime.now().strftime("%Y-%m-%dT%H:%M")
 
-    # Correlation GUID
     unique_order_id = str(uuid.uuid4())
 
     valid = 0
@@ -805,7 +803,6 @@ def build_unfi_payload(
 
     used_total = rec_ttl_total if rec_ttl_total is not None else fallback_total
 
-    # UNFI storeID (ex: 127705) must remain INSIDE payload header.storeID
     unfi_store_id = int(vendor_cfg["StoreID"])
 
     payload = {
@@ -957,8 +954,6 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
 
     session = requests.Session()
     conn: Optional[pyodbc.Connection] = None
-
-    # Keep for status/logging
     unfi_guid: str = ""
 
     try:
@@ -980,7 +975,6 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
         vendor_cfg = read_vendor_cfg(vendor)
         order_url = build_unfi_order_url(vendor_cfg)
 
-        # log clearly what URL we will POST to
         logging.info(
             f"UNFI endpoint (POST) = {order_url} | "
             f"storeId(query)=StoreNumber={store_number_sms} | "
@@ -991,12 +985,9 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
         vendor_name = get_vendor_name(conn, vendor)
         rec_hdr_f91 = get_rec_hdr_f91(conn, str(po))
 
-        # ---------------------------------------------------------------------
-        # Prevent duplicate sends:
-        # If REC_HDR.F1254 already contains a GUID, we assume the order was sent.
-        # ---------------------------------------------------------------------
-        existing_f1254 = get_rec_hdr_f1254(conn, str(po))
-        if existing_f1254 and _looks_like_guid(existing_f1254):
+        # Prevent duplicate sends (fail-closed).
+        if safe_has_existing_guid(conn, str(po)):
+            existing_f1254 = get_rec_hdr_f1254(conn, str(po))
             msg = (
                 f"PO {po} already has UNFI GUID in F1254 ({existing_f1254}). "
                 "Skipping send to prevent duplicate."
@@ -1084,26 +1075,6 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
             )
             force_keep_po_open_on_failure(conn, str(po))
             return 1
-        except Exception as e:
-            msg = _truncate_5000(f"Auth failed: {e}")
-            logging.exception(msg)
-
-            ui_summary("ERROR", msg)
-            ui_counters(sent=0, warns=int(skipped), errs=1)
-
-            insert_ravyx_po_status(
-                conn,
-                po_number=str(po),
-                vendor=vendor,
-                vendor_name=vendor_name,
-                status="FAILED",
-                f1081_text=msg,
-                dept=dept,
-                rec_hdr_f91=rec_hdr_f91,
-                process="Order Export",
-            )
-            force_keep_po_open_on_failure(conn, str(po))
-            return 1
 
         # Post (with 401/403 refresh once)
         try:
@@ -1144,13 +1115,10 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
             order_id = _extract_order_id(resp)
 
             try:
-                # Success path:
-                # - close PO
-                # - store GUID in F1254 (correlation key)
-                set_po_closed(conn, str(po))
-                set_f1254_guid(conn, str(po), unfi_guid)
+                # FIX: atomic CLOSE + GUID
+                mark_po_sent_and_store_guid(conn, str(po), unfi_guid)
             except Exception as e:
-                msg = _truncate_5000(f"Submitted OK but failed to update REC_HDR (CLOSE/F1254=GUID): {e}")
+                msg = _truncate_5000(f"Submitted OK but failed to update REC_HDR (CLOSE+GUID): {e}")
                 logging.exception(msg)
 
                 ui_summary("ERROR", "Sent OK but failed to update SMS (REC_HDR).")
@@ -1197,16 +1165,6 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
 
             ui_autoclose(20)
             return 0
-
-        if resp.status_code == 400:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            err_path = os.path.join(LOG_DIR, f"UNFI_error_PO{po}_V{vendor}_{ts}.log")
-            try:
-                with open(err_path, "w", encoding="utf-8") as f:
-                    f.write(resp.text or "")
-                logging.error(f"PO {po}: 400 response logged to {err_path}")
-            except Exception as e:
-                logging.warning(f"Unable to write 400 error file: {e}")
 
         msg = _truncate_5000(f"Order NOT sent. HTTP={resp.status_code}. {snippet}")
         logging.error(msg)
@@ -1258,6 +1216,15 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
 # =============================================================================
 # UI wrapper (opens tkinter window; falls back to console if UI not available)
 # =============================================================================
+def wants_ui() -> bool:
+    args = [a.lower() for a in sys.argv[1:]]
+    if "--noui" in args:
+        return False
+    if "--ui" in args:
+        return True
+    return _is_frozen()
+
+
 def main_with_ui() -> int:
     ui_q: "queue.Queue" = queue.Queue()
     setup_logging(ui_q=ui_q)
@@ -1296,4 +1263,7 @@ def main_with_ui() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main_with_ui())
+    setup_logging(ui_q=None)
+    if wants_ui():
+        raise SystemExit(main_with_ui())
+    raise SystemExit(run_job(ui_q=None))

@@ -12,16 +12,11 @@ from collections import namedtuple
 from typing import List, Tuple, Optional, Dict, Any, Set
 from queue import Queue
 
-import pyodbc
-import requests
-from requests import Session
-from requests.exceptions import RequestException, Timeout, HTTPError, ConnectionError
-
 from ui_send_PO_maceri import VendorSendUI
 
 
 # =============================================================================
-# Version + Path helpers
+# Version + Path + Config helpers
 # =============================================================================
 def _is_frozen() -> bool:
     return getattr(sys, "frozen", False)
@@ -31,8 +26,34 @@ def _base_dir() -> str:
     return os.path.dirname(sys.executable) if _is_frozen() else os.path.dirname(os.path.abspath(__file__))
 
 
+def _find_config_path() -> str:
+    """
+    Look for config.ini in:
+      1) Parent folder of the EXE/script folder (shared config)
+      2) Same folder as the EXE/script (local fallback)
+
+    Example:
+      ...\XchUpShop\PushSMSPOToMaceri\push.exe
+      -> tries ...\XchUpShop\config.ini first
+      -> then ...\XchUpShop\PushSMSPOToMaceri\config.ini
+    """
+    base = _base_dir()
+    parent = os.path.dirname(base)
+
+    candidates = [
+        os.path.join(parent, "config.ini"),
+        os.path.join(base, "config.ini"),
+    ]
+
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+
+    return candidates[0]  # best “expected” path for error messages
+
+
 BASE_DIR = _base_dir()
-CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
+CONFIG_PATH = _find_config_path()
 VERSION_PATH = os.path.join(BASE_DIR, "version_info.txt")
 
 
@@ -46,6 +67,10 @@ def read_version(default: str = "0.0.0.0") -> str:
 
 
 APP_VERSION = read_version()
+AUTO_CLOSE_SECONDS = 20
+
+# Globals loaded inside worker (so UI opens instantly)
+SETTINGS: Dict[str, Any] = {}
 
 
 # =============================================================================
@@ -84,37 +109,7 @@ def get_sqi_args() -> Tuple[str, int, bool]:
 
 
 # =============================================================================
-# Logging
-# =============================================================================
-LOG_DIR = os.path.join(BASE_DIR, "LOG")
-os.makedirs(LOG_DIR, exist_ok=True)
-
-log_ts = datetime.now().strftime("%Y_%m_%d")
-log_filename = os.path.join(LOG_DIR, f"ExportOrdersToMaceriSMS_logs_{log_ts}.log")
-
-root_logger = logging.getLogger()
-root_logger.handlers.clear()
-root_logger.setLevel(logging.INFO)
-
-file_handler = logging.FileHandler(log_filename, mode="a", encoding="utf-8")
-file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"))
-
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"))
-
-root_logger.addHandler(file_handler)
-root_logger.addHandler(console_handler)
-
-logging.info("=== Start run (MaceriPush) ===")
-logging.info(f"AppVersion={APP_VERSION} | Frozen={_is_frozen()} | BaseDir={BASE_DIR}")
-logging.info(f"ConfigPath={CONFIG_PATH}")
-
-AUTO_CLOSE_SECONDS = 20
-
-
-# =============================================================================
-# Logs Purge
+# Logging + purge (moved inside worker to speed UI)
 # =============================================================================
 def purge_logs(log_dir: str, days_to_keep: int) -> int:
     """
@@ -152,140 +147,82 @@ def purge_logs(log_dir: str, days_to_keep: int) -> int:
     return deleted
 
 
-# =============================================================================
-# Config (read once) + Purge call
-# =============================================================================
-config = configparser.ConfigParser()
-if not os.path.exists(CONFIG_PATH):
-    raise FileNotFoundError(f"config.ini not found next to EXE/script: {CONFIG_PATH}")
+def setup_logging(log_dir: str) -> str:
+    os.makedirs(log_dir, exist_ok=True)
 
-config.read(CONFIG_PATH, encoding="utf-8")
+    log_ts = datetime.now().strftime("%Y_%m_%d")
+    log_filename = os.path.join(log_dir, f"ExportOrdersToMaceriSMS_logs_{log_ts}.log")
 
-LOG_PURGE_DAYS = config["Settings"].getint("LogPurge", fallback=30)
-try:
-    deleted = purge_logs(LOG_DIR, LOG_PURGE_DAYS)
-    logging.info(f"Log purge: deleted {deleted} file(s) older than {LOG_PURGE_DAYS} day(s).")
-except Exception as e:
-    logging.warning(f"Log purge failed: {e}")
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.INFO)
 
-server_name = config["Settings"]["ServerName"]
-sql_driver = config["Settings"].get("SQLDriver", "SQL Server")
-database = config["Settings"].get("DatabaseName", "STORESQL")
-connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database};Trusted_Connection=yes"
+    file_handler = logging.FileHandler(log_filename, mode="a", encoding="utf-8")
+    file_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"))
 
-# Maceri settings (validated inside worker so we can still force PO open on failure)
-LOCATION_ID = config.get("Maceri", "MaceriLocationID", fallback="").strip()
-MACERI_USERNAME = config.get("Maceri", "Username", fallback="").strip()
-MACERI_PASSWORD = config.get("Maceri", "Password", fallback="").strip()
-API_AUTH_URL = config.get("Maceri", "BaseUrlAuth", fallback="").strip()
-API_ORDER_URL = config.get("Maceri", "BaseUrlOrder", fallback="").strip()
-FB_REFERER = config.get("Maceri", "FbReferer", fallback="https://tommaceri-test.fbportal.io/").strip()
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", datefmt="%H:%M:%S"))
 
-CUSTOMER_ID = "PLUMS"
-NOTES = "FROMAPI"
-SHIP_METHOD = "1"
+    root_logger.addHandler(file_handler)
+    root_logger.addHandler(console_handler)
 
-SENT_MARKER = "SENT_MACERI"
-MAX_INVALID_ITEM_RETRIES_PER_PO = 25
+    logging.info("=== Start run (MaceriPush) ===")
+    logging.info(f"AppVersion={APP_VERSION} | Frozen={_is_frozen()} | BaseDir={BASE_DIR}")
+    logging.info(f"ConfigPath={CONFIG_PATH}")
 
-logging.info(f"SQL={server_name} / {database}")
-logging.info(f"MaceriAuthUrl={API_AUTH_URL}")
-logging.info(f"MaceriOrderUrl={API_ORDER_URL}")
-logging.info(f"MaceriFbReferer={FB_REFERER}")
+    return log_filename
 
 
-# =============================================================================
-# Daily API raw log
-# =============================================================================
-API_LOG_TS = datetime.now().strftime("%Y_%m_%d")
-MACERI_API_LOG_PATH = os.path.join(LOG_DIR, f"MaceriApi_{API_LOG_TS}.log")
-MACERI_API_LOG_ERRORS_ONLY = False
+def load_settings() -> Dict[str, Any]:
+    cfg = configparser.ConfigParser()
 
-logging.info(f"MaceriApiDailyLog={MACERI_API_LOG_PATH} | ErrorsOnly={MACERI_API_LOG_ERRORS_ONLY}")
+    if not os.path.exists(CONFIG_PATH):
+        raise FileNotFoundError(
+            "config.ini not found.\n"
+            f"Tried:\n"
+            f"  1) {os.path.join(os.path.dirname(BASE_DIR), 'config.ini')}\n"
+            f"  2) {os.path.join(BASE_DIR, 'config.ini')}\n"
+        )
 
+    cfg.read(CONFIG_PATH, encoding="utf-8")
 
-def _mask_value(v: str, keep: int = 2) -> str:
-    if v is None:
-        return ""
-    s = str(v)
-    if len(s) <= keep:
-        return "*" * len(s)
-    return s[:keep] + ("*" * (len(s) - keep))
+    server_name = (cfg.get("Settings", "ServerName", fallback="") or "").strip()
+    if not server_name:
+        raise RuntimeError("Missing config.ini value: [Settings] ServerName")
 
+    sql_driver = (cfg.get("Settings", "SQLDriver", fallback="SQL Server") or "SQL Server").strip()
+    database = (cfg.get("Settings", "DatabaseName", fallback="STORESQL") or "STORESQL").strip()
 
-def _safe_json_pretty(text: str) -> str:
-    if not text:
-        return ""
-    try:
-        obj = json.loads(text)
-        return json.dumps(obj, ensure_ascii=False, indent=2)
-    except Exception:
-        return text
+    log_purge_days = cfg.getint("Settings", "LogPurge", fallback=30)
 
+    # Maceri settings
+    maceri_location_id = (cfg.get("Maceri", "MaceriLocationID", fallback="") or "").strip()
+    maceri_username = (cfg.get("Maceri", "Username", fallback="") or "").strip()
+    maceri_password = (cfg.get("Maceri", "Password", fallback="") or "").strip()
+    api_auth_url = (cfg.get("Maceri", "BaseUrlAuth", fallback="") or "").strip()
+    api_order_url = (cfg.get("Maceri", "BaseUrlOrder", fallback="") or "").strip()
+    fb_referer = (cfg.get("Maceri", "FbReferer", fallback="https://tommaceri-test.fbportal.io/") or "").strip()
 
-def _write_maceri_api_log(
-    *,
-    kind: str,
-    url: str,
-    status_code: int,
-    elapsed_s: float,
-    headers: Dict[str, str],
-    request_json: Optional[Dict[str, Any]],
-    response_text: str,
-    po_number: Optional[str] = None,
-):
-    if MACERI_API_LOG_ERRORS_ONLY and status_code < 400:
-        return
+    connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database};Trusted_Connection=yes"
 
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    po_part = f"PO={po_number}\n" if po_number else ""
-
-    hdr_lines: List[str] = []
-    for k, v in (headers or {}).items():
-        if k.lower() == "authorization":
-            vv = str(v or "").strip()
-            if vv.lower().startswith("bearer "):
-                token_only = vv.split(" ", 1)[1].strip()
-                hdr_lines.append(f"{k}: Bearer {_mask_value(token_only, keep=10)}")
-            else:
-                hdr_lines.append(f"{k}: {_mask_value(vv, keep=10)}")
-        else:
-            hdr_lines.append(f"{k}: {v}")
-    hdr_block = "\n".join(hdr_lines)
-
-    req_block = ""
-    if request_json is not None:
-        try:
-            req_block = json.dumps(request_json, ensure_ascii=False, indent=2)
-        except Exception:
-            req_block = str(request_json)
-
-    resp_block = _safe_json_pretty(response_text)
-
-    entry = (
-        "============================================================\n"
-        f"{ts}\n"
-        f"TYPE={kind}\n"
-        f"{po_part}"
-        f"URL={url}\n"
-        f"STATUS={status_code}\n"
-        f"ELAPSED={elapsed_s:.3f}s\n"
-        "HEADERS:\n"
-        f"{hdr_block}\n"
-        "\n"
-        "REQUEST JSON:\n"
-        f"{req_block}\n"
-        "\n"
-        "RESPONSE BODY:\n"
-        f"{resp_block}\n"
-        "============================================================\n\n"
-    )
-
-    try:
-        with open(MACERI_API_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(entry)
-    except Exception as e:
-        logging.warning(f"Unable to write Maceri API daily log: {e}")
+    return {
+        "cfg": cfg,
+        "server_name": server_name,
+        "sql_driver": sql_driver,
+        "database": database,
+        "connection_string": connection_string,
+        "log_dir": os.path.join(BASE_DIR, "LOG"),  # logs stay per-EXE folder (good)
+        "log_purge_days": log_purge_days,
+        "maceri": {
+            "LOCATION_ID": maceri_location_id,
+            "USERNAME": maceri_username,
+            "PASSWORD": maceri_password,
+            "API_AUTH_URL": api_auth_url,
+            "API_ORDER_URL": api_order_url,
+            "FB_REFERER": fb_referer,
+        },
+    }
 
 
 # =============================================================================
@@ -313,7 +250,7 @@ def format_requests_error(e: Exception, url: str = "") -> Tuple[str, str]:
             f"Server did not respond or is unreachable (max retries exceeded).\nURL: {url}\nCheck: network, firewall/proxy, and server availability.\n\nDetails: {raw}",
         )
 
-    if "timed out" in low or isinstance(e, Timeout):
+    if "timed out" in low:
         return (
             "Network timeout",
             f"Server is not responding in time (timeout).\nURL: {url}\nTry again later or check connectivity.\n\nDetails: {raw}",
@@ -492,9 +429,98 @@ def _remove_missing_itemcode_dupes(all_skips: Dict[str, Set[str]]) -> None:
 
 
 # =============================================================================
+# Daily API raw log (settings loaded in worker)
+# =============================================================================
+def _mask_value(v: str, keep: int = 2) -> str:
+    if v is None:
+        return ""
+    s = str(v)
+    if len(s) <= keep:
+        return "*" * len(s)
+    return s[:keep] + ("*" * (len(s) - keep))
+
+
+def _safe_json_pretty(text: str) -> str:
+    if not text:
+        return ""
+    try:
+        obj = json.loads(text)
+        return json.dumps(obj, ensure_ascii=False, indent=2)
+    except Exception:
+        return text
+
+
+def _write_maceri_api_log(
+    *,
+    maceri_api_log_path: str,
+    errors_only: bool,
+    kind: str,
+    url: str,
+    status_code: int,
+    elapsed_s: float,
+    headers: Dict[str, str],
+    request_json: Optional[Dict[str, Any]],
+    response_text: str,
+    po_number: Optional[str] = None,
+):
+    if errors_only and status_code < 400:
+        return
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    po_part = f"PO={po_number}\n" if po_number else ""
+
+    hdr_lines: List[str] = []
+    for k, v in (headers or {}).items():
+        if k.lower() == "authorization":
+            vv = str(v or "").strip()
+            if vv.lower().startswith("bearer "):
+                token_only = vv.split(" ", 1)[1].strip()
+                hdr_lines.append(f"{k}: Bearer {_mask_value(token_only, keep=10)}")
+            else:
+                hdr_lines.append(f"{k}: {_mask_value(vv, keep=10)}")
+        else:
+            hdr_lines.append(f"{k}: {v}")
+    hdr_block = "\n".join(hdr_lines)
+
+    req_block = ""
+    if request_json is not None:
+        try:
+            req_block = json.dumps(request_json, ensure_ascii=False, indent=2)
+        except Exception:
+            req_block = str(request_json)
+
+    resp_block = _safe_json_pretty(response_text)
+
+    entry = (
+        "============================================================\n"
+        f"{ts}\n"
+        f"TYPE={kind}\n"
+        f"{po_part}"
+        f"URL={url}\n"
+        f"STATUS={status_code}\n"
+        f"ELAPSED={elapsed_s:.3f}s\n"
+        "HEADERS:\n"
+        f"{hdr_block}\n"
+        "\n"
+        "REQUEST JSON:\n"
+        f"{req_block}\n"
+        "\n"
+        "RESPONSE BODY:\n"
+        f"{resp_block}\n"
+        "============================================================\n\n"
+    )
+
+    try:
+        with open(maceri_api_log_path, "a", encoding="utf-8") as f:
+            f.write(entry)
+    except Exception as e:
+        logging.warning(f"Unable to write Maceri API daily log: {e}")
+
+
+# =============================================================================
 # SQL helpers
 # =============================================================================
-def get_vendor_name(conn: pyodbc.Connection, vendor: int) -> Optional[str]:
+def get_vendor_name(conn, vendor: int) -> Optional[str]:
     q = "SELECT TOP 1 LTRIM(RTRIM(CAST(F334 AS varchar(60)))) FROM [dbo].[VENDOR_TAB] WHERE F27 = ?"
     cur = conn.cursor()
     cur.execute(q, (vendor,))
@@ -505,7 +531,7 @@ def get_vendor_name(conn: pyodbc.Connection, vendor: int) -> Optional[str]:
     return name or None
 
 
-def get_rec_hdr_f91(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
+def get_rec_hdr_f91(conn, po_number: str) -> Optional[str]:
     try:
         cur = conn.cursor()
         cur.execute("SELECT TOP 1 F91 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
@@ -521,7 +547,7 @@ def get_rec_hdr_f91(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
         return None
 
 
-def get_rec_hdr_f1254(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
+def get_rec_hdr_f1254(conn, po_number: str) -> Optional[str]:
     try:
         cur = conn.cursor()
         cur.execute("SELECT TOP 1 F1254 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
@@ -533,7 +559,7 @@ def get_rec_hdr_f1254(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
         return None
 
 
-def is_po_already_sent(conn: pyodbc.Connection, po_number: str, marker: str) -> bool:
+def is_po_already_sent(conn, po_number: str, marker: str) -> bool:
     """
     True if REC_HDR.F1254 already contains marker (case-insensitive).
     """
@@ -551,13 +577,11 @@ def is_po_already_sent(conn: pyodbc.Connection, po_number: str, marker: str) -> 
         )
         return cur.fetchone() is not None
     except Exception:
-        # Fail-open would be dangerous (could resend), so fail-closed:
-        # if we can't check, consider it "already sent" to prevent duplicates.
         logging.warning(f"PO {po_number}: unable to verify sent marker in F1254; blocking resend for safety.")
         return True
 
 
-def get_po_data(conn: pyodbc.Connection, po_number: str):
+def get_po_data(conn, po_number: str):
     query = """
         SELECT
             REG.F1032 AS PO,
@@ -590,7 +614,7 @@ def get_first_dept(po_rows) -> Optional[int]:
 
 
 def insert_ravyx_po_status(
-    conn: pyodbc.Connection,
+    conn,
     *,
     po_number: str,
     vendor: int,
@@ -646,7 +670,7 @@ def insert_ravyx_po_status(
     )
 
 
-def append_sent_marker(conn: pyodbc.Connection, po_number: str, marker: str) -> bool:
+def append_sent_marker(conn, po_number: str, marker: str) -> bool:
     update_query = """
         UPDATE [dbo].[REC_HDR]
         SET F1254 =
@@ -675,7 +699,7 @@ def _clean_marker_from_f1254(f1254: Optional[str], marker: str) -> Optional[str]
     return cleaned or None
 
 
-def force_keep_po_open_on_failure(conn: pyodbc.Connection, po_number: str, marker: str = SENT_MARKER) -> None:
+def force_keep_po_open_on_failure(conn, po_number: str, marker: str) -> None:
     cur = conn.cursor()
 
     cur.execute("SELECT F1254 FROM [dbo].[REC_HDR] WHERE F1032 = ?", (po_number,))
@@ -697,7 +721,7 @@ def force_keep_po_open_on_failure(conn: pyodbc.Connection, po_number: str, marke
     logging.warning(f"PO {po_number}: forced OPEN (failure path). Marker '{marker}' removed if present.")
 
 
-def delete_invalid_item_from_po(conn: pyodbc.Connection, po_number: str, item_code: str) -> int:
+def delete_invalid_item_from_po(conn, po_number: str, item_code: str) -> int:
     q = """
         DELETE FROM [dbo].[REC_REG]
         WHERE F1032 = ?
@@ -714,39 +738,41 @@ def delete_invalid_item_from_po(conn: pyodbc.Connection, po_number: str, item_co
 # =============================================================================
 # API helpers
 # =============================================================================
-def _validate_maceri_config() -> None:
+def _validate_maceri_config(maceri: Dict[str, str]) -> None:
     missing = []
-    if not LOCATION_ID:
+    if not maceri.get("LOCATION_ID"):
         missing.append("[Maceri] MaceriLocationID")
-    if not MACERI_USERNAME:
+    if not maceri.get("USERNAME"):
         missing.append("[Maceri] Username")
-    if not MACERI_PASSWORD:
+    if not maceri.get("PASSWORD"):
         missing.append("[Maceri] Password")
-    if not API_AUTH_URL:
+    if not maceri.get("API_AUTH_URL"):
         missing.append("[Maceri] BaseUrlAuth")
-    if not API_ORDER_URL:
+    if not maceri.get("API_ORDER_URL"):
         missing.append("[Maceri] BaseUrlOrder")
 
     if missing:
         raise RuntimeError("Missing config.ini value(s): " + ", ".join(missing))
 
 
-def get_api_token(session: Session) -> str:
-    payload = {"userName": MACERI_USERNAME, "password": MACERI_PASSWORD, "persist": True}
-    headers = {"Fb-Referer": FB_REFERER, "Content-Type": "application/json"}
+def get_api_token(session, *, maceri: Dict[str, str], api_log_path: str, api_log_errors_only: bool) -> str:
+    payload = {"userName": maceri["USERNAME"], "password": maceri["PASSWORD"], "persist": True}
+    headers = {"Fb-Referer": maceri["FB_REFERER"], "Content-Type": "application/json"}
 
     t0 = time.perf_counter()
-    resp = session.post(API_AUTH_URL, headers=headers, json=payload, timeout=90)
+    resp = session.post(maceri["API_AUTH_URL"], headers=headers, json=payload, timeout=90)
     elapsed = time.perf_counter() - t0
 
     raw_text = resp.text or ""
     _write_maceri_api_log(
+        maceri_api_log_path=api_log_path,
+        errors_only=api_log_errors_only,
         kind="AUTH",
-        url=API_AUTH_URL,
+        url=maceri["API_AUTH_URL"],
         status_code=resp.status_code,
         elapsed_s=elapsed,
         headers=headers,
-        request_json={"userName": MACERI_USERNAME, "password": "***", "persist": True},
+        request_json={"userName": maceri["USERNAME"], "password": "***", "persist": True},
         response_text=raw_text,
         po_number=None,
     )
@@ -759,20 +785,30 @@ def get_api_token(session: Session) -> str:
     return token
 
 
-def send_to_api(session: Session, payload: Dict[str, Any], token: str) -> Tuple[bool, int, str, str]:
+def send_to_api(
+    session,
+    payload: Dict[str, Any],
+    token: str,
+    *,
+    maceri: Dict[str, str],
+    api_log_path: str,
+    api_log_errors_only: bool,
+) -> Tuple[bool, int, str, str]:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     po_number = payload.get("customerPurchaseOrderNumber", "?")
 
     t0 = time.perf_counter()
-    resp = session.post(API_ORDER_URL, headers=headers, json=payload, timeout=120)
+    resp = session.post(maceri["API_ORDER_URL"], headers=headers, json=payload, timeout=120)
     elapsed = time.perf_counter() - t0
 
     raw_text = resp.text or ""
     snippet = raw_text[:400].replace("\n", " ")
 
     _write_maceri_api_log(
+        maceri_api_log_path=api_log_path,
+        errors_only=api_log_errors_only,
         kind="ORDER",
-        url=API_ORDER_URL,
+        url=maceri["API_ORDER_URL"],
         status_code=resp.status_code,
         elapsed_s=elapsed,
         headers={"Content-Type": "application/json", "Authorization": headers["Authorization"]},
@@ -790,6 +826,14 @@ def send_to_api(session: Session, payload: Dict[str, Any], token: str) -> Tuple[
 # =============================================================================
 # Payload builder
 # =============================================================================
+CUSTOMER_ID = "PLUMS"
+NOTES = "FROMAPI"
+SHIP_METHOD = "1"
+
+SENT_MARKER = "SENT_MACERI"
+MAX_INVALID_ITEM_RETRIES_PER_PO = 25
+
+
 def _safe_date_to_yyyy_mm_dd(value) -> str:
     if value is None:
         return datetime.now().strftime("%Y-%m-%d")
@@ -813,7 +857,7 @@ def build_json_payload(po_rows, po_number: str) -> Tuple[Optional[Dict[str, Any]
 
     payload: Dict[str, Any] = {
         "customerId": CUSTOMER_ID,
-        "customerLocationId": LOCATION_ID,
+        "customerLocationId": SETTINGS["maceri"]["LOCATION_ID"],
         "requiredDeliveryDate": delivery_date,
         "notes": NOTES,
         "shipMethod": SHIP_METHOD,
@@ -869,21 +913,50 @@ def build_json_payload(po_rows, po_number: str) -> Tuple[Optional[Dict[str, Any]
 # Worker
 # =============================================================================
 def worker(ui_q: Queue):
+    import pyodbc
+    import requests
+    from requests.exceptions import RequestException, Timeout, HTTPError, ConnectionError
+
     def ui(level: str, msg: str, detail: str = ""):
         try:
             ui_q.put((level, msg, detail))
         except Exception:
             pass
 
-    session = requests.Session()
     conn: Optional[pyodbc.Connection] = None
+    session = requests.Session()
 
     po = ""
     vendor = 0
     vendor_name: Optional[str] = None
     force_send = False
+    rec_hdr_f91: Optional[str] = None
 
     try:
+        global SETTINGS
+        SETTINGS = load_settings()
+
+        log_dir = SETTINGS["log_dir"]
+        setup_logging(log_dir)
+
+        try:
+            deleted = purge_logs(log_dir, SETTINGS["log_purge_days"])
+            logging.info(f"Log purge: deleted {deleted} file(s) older than {SETTINGS['log_purge_days']} day(s).")
+        except Exception as e:
+            logging.warning(f"Log purge failed: {e}")
+
+        maceri = SETTINGS["maceri"]
+
+        api_log_ts = datetime.now().strftime("%Y_%m_%d")
+        maceri_api_log_path = os.path.join(log_dir, f"MaceriApi_{api_log_ts}.log")
+        maceri_api_log_errors_only = False
+
+        logging.info(f"SQL={SETTINGS['server_name']} / {SETTINGS['database']}")
+        logging.info(f"MaceriAuthUrl={maceri['API_AUTH_URL']}")
+        logging.info(f"MaceriOrderUrl={maceri['API_ORDER_URL']}")
+        logging.info(f"MaceriFbReferer={maceri['FB_REFERER']}")
+        logging.info(f"MaceriApiDailyLog={maceri_api_log_path} | ErrorsOnly={maceri_api_log_errors_only}")
+
         po, vendor, force_send = get_sqi_args()
         logging.info(f"SQI args: PO={po} Vendor={vendor} Force={force_send}")
 
@@ -891,17 +964,14 @@ def worker(ui_q: Queue):
         ui("INFO", "SQI Parameters", f"PO={po} | Vendor={vendor} | Force={force_send}")
         ui("INFO", "Loading config.ini...", os.path.basename(CONFIG_PATH))
 
-        ui("INFO", "Connecting to SQL...", f"{server_name} / {database}")
-        conn = pyodbc.connect(connection_string)
+        ui("INFO", "Connecting to SQL...", f"{SETTINGS['server_name']} / {SETTINGS['database']}")
+        conn = pyodbc.connect(SETTINGS["connection_string"])
 
         vendor_name = get_vendor_name(conn, vendor)
         rec_hdr_f91 = get_rec_hdr_f91(conn, str(po))
         logging.info(f"Vendor lookup: F27={vendor} => VendorName={vendor_name!r}")
         logging.info(f"REC_HDR lookup: PO={po} => F91={rec_hdr_f91!r}")
 
-        # ---------------------------------------------------------------------
-        #  Don't send the same PO twice 
-        # ---------------------------------------------------------------------
         if not force_send:
             if is_po_already_sent(conn, str(po), SENT_MARKER):
                 f1254 = get_rec_hdr_f1254(conn, str(po))
@@ -910,7 +980,6 @@ def worker(ui_q: Queue):
                 ui("WARN", msg, detail)
                 logging.warning(f"{msg} {detail}")
 
-                # Log a WARN 
                 try:
                     insert_ravyx_po_status(
                         conn,
@@ -929,14 +998,19 @@ def worker(ui_q: Queue):
                 ui("DONE", "Skipped", f"Auto-close in {AUTO_CLOSE_SECONDS}s.")
                 return
 
-        _validate_maceri_config()
+        _validate_maceri_config(maceri)
 
         ui("INFO", "Authenticating with Maceri...", "")
         try:
-            token = get_api_token(session)
+            token = get_api_token(
+                session,
+                maceri=maceri,
+                api_log_path=maceri_api_log_path,
+                api_log_errors_only=maceri_api_log_errors_only,
+            )
             ui("INFO", "Auth OK", "Sending single PO from SQI")
         except (ConnectionError, Timeout, HTTPError, RequestException) as e:
-            title, detail = format_requests_error(e, API_AUTH_URL)
+            title, detail = format_requests_error(e, maceri["API_AUTH_URL"])
             ui("ERROR", title, detail)
             logging.exception(f"Auth/network error: {e}")
 
@@ -991,14 +1065,26 @@ def worker(ui_q: Queue):
                 break
 
             try:
-                ok, status_code, snippet, raw_text = send_to_api(session, payload, token)
+                ok, status_code, snippet, raw_text = send_to_api(
+                    session,
+                    payload,
+                    token,
+                    maceri=maceri,
+                    api_log_path=maceri_api_log_path,
+                    api_log_errors_only=maceri_api_log_errors_only,
+                )
 
                 if not ok and status_code in (401, 403):
                     ui("WARN", "Authentication error", "Received 401/403. Refreshing token and retrying once...")
                     try:
-                        token = get_api_token(session)
+                        token = get_api_token(
+                            session,
+                            maceri=maceri,
+                            api_log_path=maceri_api_log_path,
+                            api_log_errors_only=maceri_api_log_errors_only,
+                        )
                     except (ConnectionError, Timeout, HTTPError, RequestException) as e:
-                        title, detail = format_requests_error(e, API_AUTH_URL)
+                        title, detail = format_requests_error(e, maceri["API_AUTH_URL"])
                         ui("ERROR", title, detail)
                         logging.exception(f"Token refresh error: {e}")
                         insert_ravyx_po_status(
@@ -1015,7 +1101,14 @@ def worker(ui_q: Queue):
                         force_keep_po_open_on_failure(conn, str(po), SENT_MARKER)
                         break
 
-                    ok, status_code, snippet, raw_text = send_to_api(session, payload, token)
+                    ok, status_code, snippet, raw_text = send_to_api(
+                        session,
+                        payload,
+                        token,
+                        maceri=maceri,
+                        api_log_path=maceri_api_log_path,
+                        api_log_errors_only=maceri_api_log_errors_only,
+                    )
 
                 if ok:
                     append_sent_marker(conn, po, SENT_MARKER)
@@ -1101,7 +1194,7 @@ def worker(ui_q: Queue):
                 break
 
             except (ConnectionError, Timeout, HTTPError, RequestException) as e:
-                title, detail = format_requests_error(e, API_ORDER_URL)
+                title, detail = format_requests_error(e, maceri["API_ORDER_URL"])
                 ui("ERROR", title, detail)
                 logging.exception(f"Network/API error: {e}")
                 insert_ravyx_po_status(
@@ -1139,7 +1232,11 @@ def worker(ui_q: Queue):
         ui("DONE", "Maceri PO push completed", f"Auto-close in {AUTO_CLOSE_SECONDS}s.")
 
     except Exception as e:
-        logging.exception(f"Fatal error: {e}")
+        try:
+            logging.exception(f"Fatal error: {e}")
+        except Exception:
+            pass
+
         try:
             if conn is not None and po:
                 try:
@@ -1148,7 +1245,7 @@ def worker(ui_q: Queue):
                     pass
 
             err_txt = str(e)
-            if "Missing config.ini value(s)" in err_txt:
+            if "Missing config.ini value(s)" in err_txt or "Missing config.ini value:" in err_txt:
                 ui_q.put(("ERROR", "Invalid config.ini", err_txt))
             else:
                 ui_q.put(("ERROR", "Fatal error", err_txt))

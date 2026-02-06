@@ -1,14 +1,3 @@
-# main.py (import_orders_into_sms) - corrected
-#
-# Fixes included:
-# 1) If DB config missing (DatabaseName empty) -> clear UX + STOP (NO API call).
-# 2) If DB connection fails -> clear UX + STOP normal flow (no purge SQL tables, no API call).
-# 3) Validate required DB objects (TMP_REC_BAT/TMP_REC_DTL/VENDOR_TAB/RAVYX_PO_STATUS) BEFORE any Upshop export (prevents consuming PO).
-# 4) Purge RAVYX_PO_STATUS is skipped with friendly message if table not accessible.
-# 5) Avoid writing RUN FAILED row to RAVYX_PO_STATUS when DB isn't usable.
-# 6) Avoid misleading status in finally when DB never opened.
-# 7) IMPORTANT: If Upshop returns 0 approved orders -> DO NOT write a "blank" SUCCESS row to RAVYX_PO_STATUS.
-
 import os
 import sys
 import time
@@ -28,11 +17,38 @@ from requests.exceptions import HTTPError, Timeout, RequestException
 from shared.http_errors import HTTP_ERROR_MESSAGES
 
 # =============================================================================
-# BASE DIR
+# BASE DIR + CONFIG SEARCH
 # =============================================================================
 
-IS_FROZEN = getattr(sys, "frozen", False)
-BASE_DIR = os.path.dirname(sys.executable) if IS_FROZEN else os.path.dirname(os.path.abspath(__file__))
+def _is_frozen() -> bool:
+    return getattr(sys, "frozen", False)
+
+
+def _exe_dir() -> str:
+    # folder where the exe lives (onedir/onefile) OR the .py in dev
+    return os.path.dirname(sys.executable) if _is_frozen() else os.path.dirname(os.path.abspath(__file__))
+
+
+def find_file_upwards(start_dir: str, filename: str, max_levels: int = 10) -> Optional[str]:
+    """
+    Search filename in start_dir, then in parents, returning first match (full path).
+    """
+    d = os.path.abspath(start_dir)
+    for _ in range(max_levels + 1):
+        candidate = os.path.join(d, filename)
+        if os.path.isfile(candidate):
+            return candidate
+
+        parent = os.path.dirname(d)
+        if parent == d:  # reached root
+            break
+        d = parent
+
+    return None
+
+
+IS_FROZEN = _is_frozen()
+BASE_DIR = _exe_dir()
 
 # =============================================================================
 # RUN ID
@@ -58,7 +74,14 @@ ui_queue = Queue()
 # =============================================================================
 
 def get_config_path() -> str:
-    return os.path.join(BASE_DIR, "config.ini")
+    """
+    Prefer a single shared config.ini:
+    - look in BASE_DIR
+    - then parent folders
+    - take the first found
+    """
+    found = find_file_upwards(BASE_DIR, "config.ini", max_levels=10)
+    return found if found else os.path.join(BASE_DIR, "config.ini")
 
 # =============================================================================
 # SETTINGS / PARSERS
@@ -233,7 +256,11 @@ def request_json(method: str, url: str, *, headers=None, json_body=None, timeout
 
 CONFIG_PATH = get_config_path()
 if not os.path.exists(CONFIG_PATH):
-    raise FileNotFoundError(f"config.ini not found at: {CONFIG_PATH}")
+    raise FileNotFoundError(
+        "config.ini not found. Searched current folder and parents.\n"
+        f"StartDir={BASE_DIR}\n"
+        f"TriedPath={CONFIG_PATH}"
+    )
 
 config = configparser.ConfigParser()
 config.read(CONFIG_PATH, encoding="utf-8")
@@ -264,7 +291,9 @@ if debug_console:
     logging.getLogger().addHandler(console)
 
 logging.info("=== Start run ===")
+logging.info(f"FROZEN={IS_FROZEN}")
 logging.info(f"BASE_DIR={BASE_DIR}")
+logging.info(f"CONFIG_PATH={CONFIG_PATH}")
 logging.info(f"RUN_ID={RUN_ID}")
 
 # =============================================================================
@@ -390,7 +419,6 @@ def purge_ravyx_po_status(conn, keep_days: int) -> int:
             cur.close()
         except Exception:
             pass
-
 
 # =============================================================================
 # SQL HELPERS

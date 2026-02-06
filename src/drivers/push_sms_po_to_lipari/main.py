@@ -27,7 +27,25 @@ def _base_dir() -> str:
 
 
 BASE_DIR = _base_dir()
-CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
+
+
+def find_config_path() -> str:
+    """
+    Look for config.ini:
+      1) next to EXE/script (BASE_DIR)
+      2) one folder above BASE_DIR -> shared config.ini
+    """
+    candidates = [
+        os.path.join(BASE_DIR, "config.ini"),
+        os.path.join(os.path.dirname(BASE_DIR), "config.ini"),
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return candidates[-1]  # for a clear error message
+
+
+CONFIG_PATH = find_config_path()
 VERSION_PATH = os.path.join(BASE_DIR, "version_info.txt")
 
 
@@ -44,7 +62,7 @@ APP_VERSION = read_version()
 
 
 # =============================================================================
-# Args from SQI 
+# Args from SQI
 # =============================================================================
 def _strip_quotes(s: str) -> str:
     return (s or "").strip().strip('"').strip("'")
@@ -117,7 +135,7 @@ def setup_logging(ui_q: Optional["queue.Queue"] = None) -> None:
 
 
 # =============================================================================
-# Logs purge 
+# Logs purge
 # =============================================================================
 def purge_logs(log_dir: str, days_to_keep: int) -> int:
     if not days_to_keep or days_to_keep <= 0:
@@ -151,30 +169,33 @@ def purge_logs(log_dir: str, days_to_keep: int) -> int:
 # =============================================================================
 config = configparser.ConfigParser()
 if not os.path.exists(CONFIG_PATH):
-    raise FileNotFoundError(f"config.ini not found next to EXE/script: {CONFIG_PATH}")
+    raise FileNotFoundError(f"config.ini not found: {CONFIG_PATH}")
 
 config.read(CONFIG_PATH, encoding="utf-8")
 
-LOG_PURGE_DAYS = config["Settings"].getint("LogPurge", fallback=30)
+LOG_PURGE_DAYS = config.getint("Settings", "LogPurge", fallback=30)
 
-server_name = config["Settings"]["ServerName"]
-sql_driver = config["Settings"].get("SQLDriver", "SQL Server")
-database = config["Settings"].get("DatabaseName", "STORESQL")
-server_ip = config["Settings"].get("FTPServerIP", "").strip()
+server_name = (config.get("Settings", "ServerName", fallback="") or "").strip()
+if not server_name:
+    raise RuntimeError("Missing config.ini value: [Settings] ServerName")
+
+sql_driver = (config.get("Settings", "SQLDriver", fallback="SQL Server") or "SQL Server").strip()
+database = (config.get("Settings", "DatabaseName", fallback="STORESQL") or "STORESQL").strip()
+server_ip = (config.get("Settings", "FTPServerIP", fallback="") or "").strip()
 
 # Lipari
-LIPARI_LOCATION_ID = config.get("Lipari", "LipariLocationID", fallback="3").strip() or "3"
-LIPARI_STORE_NUMBER_CONST = config.get("Lipari", "StoreNumberConst", fallback="12557000").strip() or "12557000"
-LIPARI_PO_SUFFIX = config.get("Lipari", "PoSuffixFilter", fallback="10950").strip() or "10950"
+LIPARI_LOCATION_ID = (config.get("Lipari", "LipariLocationID", fallback="3") or "3").strip() or "3"
+LIPARI_STORE_NUMBER_CONST = (config.get("Lipari", "StoreNumberConst", fallback="12557000") or "12557000").strip() or "12557000"
+LIPARI_PO_SUFFIX = (config.get("Lipari", "PoSuffixFilter", fallback="10950") or "10950").strip() or "10950"
 
 # Destination share (Windows share)
 DEFAULT_SHARE = fr"\\{server_ip}\c$\Vendor Files\Lipari\PO" if server_ip else ""
-DEST_SHARE = config.get("Lipari", "DestShare", fallback=DEFAULT_SHARE).strip()
+DEST_SHARE = (config.get("Lipari", "DestShare", fallback=DEFAULT_SHARE) or "").strip()
 if not DEST_SHARE:
     raise RuntimeError("Lipari destination share is empty. Set [Settings] FTPServerIP or [Lipari] DestShare.")
 
-# Always-backup folder for produced CSV
-CSV_BACKUP_SUBDIR = config.get("Lipari", "CsvBackupSubdir", fallback="CSV").strip() or "CSV"
+# Always-backup folder for produced CSV (local to exe folder)
+CSV_BACKUP_SUBDIR = (config.get("Lipari", "CsvBackupSubdir", fallback="CSV") or "CSV").strip() or "CSV"
 CSV_BACKUP_DIR = os.path.join(BASE_DIR, CSV_BACKUP_SUBDIR)
 os.makedirs(CSV_BACKUP_DIR, exist_ok=True)
 
@@ -193,17 +214,13 @@ LIPARI_SENT_MARKER = "SENT_LIPARI"
 
 
 # =============================================================================
-# Helpers 
+# Helpers
 # =============================================================================
 def _safe_str(x: Any) -> str:
     return ("" if x is None else str(x)).strip()
 
 
 def log_bad_item(po_number: str, row: Any, reason: str) -> str:
-    """
-    Logs a skipped item into the MAIN log only,
-    and returns a short string usable for RAVYX_PO_STATUS.F1081.
-    """
     upc = _safe_str(getattr(row, "PlumItemCode", ""))
     item = _safe_str(getattr(row, "LipariItemCode", ""))
     qty = _safe_str(getattr(row, "Quantity", ""))
@@ -282,7 +299,6 @@ def insert_ravyx_po_status(
     f1081_val = _truncate_5000(f1081_text or "") or None
     vname = (vendor_name or "").strip() or None
 
-    # Keep real REC_HDR.F91 only on SUCCESS/WARN; otherwise runid.
     use_hdr_f91 = (process == "Order Export" and status in ("SUCCESS", "WARN") and (rec_hdr_f91 or "").strip())
     f91_value = (rec_hdr_f91.strip() if use_hdr_f91 else runid)
 
@@ -315,7 +331,7 @@ def insert_ravyx_po_status(
 
 
 # =============================================================================
-# NEW: REC_HDR.F1254 marker helpers
+# REC_HDR.F1254 marker helpers (FIXED)
 # =============================================================================
 def get_rec_hdr_f1254(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
     try:
@@ -330,22 +346,101 @@ def get_rec_hdr_f1254(conn: pyodbc.Connection, po_number: str) -> Optional[str]:
         return None
 
 
-def set_f1254_marker(conn: pyodbc.Connection, po_number: str, marker: str) -> None:
+def is_po_already_sent(conn: pyodbc.Connection, po_number: str, marker: str) -> bool:
+    """
+    True if REC_HDR.F1254 already contains marker (case-insensitive).
+    """
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT TOP 1 1
+            FROM [dbo].[REC_HDR]
+            WHERE F1032 = ?
+              AND F1254 IS NOT NULL
+              AND LOWER(F1254) LIKE ?
+            """,
+            (po_number, f"%{marker.lower()}%"),
+        )
+        return cur.fetchone() is not None
+    except Exception:
+        # Fail-closed: if we can't verify, we avoid sending twice.
+        logging.warning(f"PO {po_number}: unable to verify marker in F1254; blocking resend for safety.")
+        return True
+
+
+def append_f1254_marker(conn: pyodbc.Connection, po_number: str, marker: str) -> None:
+    """
+    Append marker to F1254 without overwriting existing content.
+    """
     marker = (marker or "").strip()
     if not marker:
         raise ValueError("Marker is empty; cannot write F1254.")
 
+    like_marker = f"%{marker}%"
     cur = conn.cursor()
     cur.execute(
         """
         UPDATE [dbo].[REC_HDR]
-        SET F1254 = ?
+        SET F1254 =
+            CASE
+                WHEN F1254 IS NULL OR LTRIM(RTRIM(F1254)) = '' THEN ?
+                WHEN F1254 LIKE ? THEN F1254
+                ELSE F1254 + ' | ' + ?
+            END
         WHERE F1032 = ?
+          AND (F1254 IS NULL OR F1254 NOT LIKE ?)
         """,
-        (marker, po_number),
+        (marker, like_marker, marker, po_number, like_marker),
     )
+    # commit is handled by caller (transaction)
+    logging.info(f"PO {po_number}: marker '{marker}' appended to F1254 (if not already present).")
+
+
+def force_keep_po_open(conn: pyodbc.Connection, po_number: str) -> None:
+    cur = conn.cursor()
+    cur.execute("UPDATE [dbo].[REC_HDR] SET F1067 = 'OPEN' WHERE F1032 = ?", (po_number,))
     conn.commit()
-    logging.info(f"PO {po_number}: REC_HDR.F1254 set to marker '{marker}'.")
+    logging.warning(f"PO {po_number}: forced OPEN (failure path).")
+
+
+def mark_po_sent_and_close(conn: pyodbc.Connection, po_number: str, marker: str) -> None:
+    """
+    Atomic: CLOSE + append marker in ONE transaction.
+    If anything fails, rollback and keep PO OPEN.
+    """
+    try:
+        conn.autocommit = False
+        cur = conn.cursor()
+
+        # Append marker first (no commit here)
+        append_f1254_marker(conn, po_number, marker)
+
+        # Then close
+        cur.execute("UPDATE [dbo].[REC_HDR] SET F1067 = 'CLOSE' WHERE F1032 = ?", (po_number,))
+
+        conn.commit()
+        logging.info(f"PO {po_number}: marked sent ({marker}) and CLOSED (atomic).")
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+        logging.exception(f"PO {po_number}: FAILED to mark/close atomically: {type(e).__name__}: {e}")
+
+        # Safety: force OPEN if it was partially updated somehow
+        try:
+            force_keep_po_open(conn, po_number)
+        except Exception:
+            pass
+
+        raise
+    finally:
+        try:
+            conn.autocommit = True
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -390,20 +485,6 @@ def get_po_rows(conn: pyodbc.Connection, po_number: str):
     rows = [Row(*r) for r in cur.fetchall()]
     logging.info(f"PO {po_number}: fetched {len(rows)} line(s).")
     return rows
-
-
-def set_po_closed(conn: pyodbc.Connection, po_number: str) -> None:
-    cur = conn.cursor()
-    cur.execute("UPDATE [dbo].[REC_HDR] SET F1067 = 'CLOSE' WHERE F1032 = ?", (po_number,))
-    conn.commit()
-    logging.info(f"PO {po_number}: REC_HDR.F1067 set to 'CLOSE'.")
-
-
-def force_keep_po_open(conn: pyodbc.Connection, po_number: str) -> None:
-    cur = conn.cursor()
-    cur.execute("UPDATE [dbo].[REC_HDR] SET F1067 = 'OPEN' WHERE F1032 = ?", (po_number,))
-    conn.commit()
-    logging.warning(f"PO {po_number}: forced OPEN (failure path).")
 
 
 def get_dept_for_upc(conn: pyodbc.Connection, upc: str) -> Optional[str]:
@@ -470,13 +551,6 @@ def build_csv_payload(
     po_rows,
     po_number: str
 ) -> Tuple[Optional[List[List[Any]]], int, int, List[str]]:
-    """
-    Returns:
-      payload (or None),
-      valid_lines,
-      skipped_lines,
-      skipped_details[]  (strings to include in RAVYX_PO_STATUS.F1081)
-    """
     logging.info(f"PO {po_number}: CSV build start ...")
 
     if not po_rows:
@@ -528,9 +602,6 @@ def build_csv_payload(
 
 
 def _format_skipped_for_f1081(skipped_details: List[str], max_chars: int = 2000) -> str:
-    """
-    Create a compact 'SkippedItems:' section for F1081.
-    """
     if not skipped_details:
         return ""
 
@@ -551,7 +622,7 @@ def _format_skipped_for_f1081(skipped_details: List[str], max_chars: int = 2000)
 
 
 # =============================================================================
-# File helpers 
+# File helpers
 # =============================================================================
 def _safe_makedirs(p: str) -> None:
     os.makedirs(p, exist_ok=True)
@@ -686,11 +757,12 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
             vendor_name = get_vendor_name(conn, vendor_arg) if vendor_arg else None
             rec_hdr_f91 = get_rec_hdr_f91(conn, str(po))
 
-            # NEW: skip if already marked as sent
-            existing_f1254 = get_rec_hdr_f1254(conn, str(po))
-            if existing_f1254 and existing_f1254.strip().upper() == LIPARI_SENT_MARKER:
-                msg = f"PO {po}: already sent (F1254={LIPARI_SENT_MARKER}). Skipping."
-                logging.info(msg)
+            # FIX: check contains marker, not equals
+            if is_po_already_sent(conn, str(po), LIPARI_SENT_MARKER):
+                f1254 = get_rec_hdr_f1254(conn, str(po))
+                msg = f"PO {po}: already sent (marker {LIPARI_SENT_MARKER}). Skipping."
+                detail = f"REC_HDR.F1254={f1254!r}"
+                logging.info(f"{msg} {detail}")
                 ui_summary("WARN", msg)
 
                 try:
@@ -700,7 +772,7 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                         vendor=vendor_arg or 0,
                         vendor_name=vendor_name,
                         status="WARN",
-                        f1081_text=msg,
+                        f1081_text=f"{msg} | {detail}",
                         dept=None,
                         rec_hdr_f91=rec_hdr_f91,
                         process="Order Export",
@@ -712,7 +784,6 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 continue
 
             po_rows = get_po_rows(conn, po)
-
             dept = get_first_dept_from_order(conn, po_rows)
             logging.info(f"PO {po}: Dept(F03) resolved from first REC_REG line: {dept!r}")
 
@@ -755,11 +826,8 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
                 ui_summary("INFO", f"Sending PO {po} to share…")
                 dest_path = copy_backup_to_share(backup_path, po)
 
-                # SUCCESS path:
-                # - close PO
-                # - mark as SENT in F1254
-                set_po_closed(conn, po)
-                set_f1254_marker(conn, po, LIPARI_SENT_MARKER)
+                # FIX: atomic CLOSE + marker (cannot end up CLOSE without marker)
+                mark_po_sent_and_close(conn, po, LIPARI_SENT_MARKER)
 
                 totals["sent_pos"] += 1
                 ui_counters(sent=totals["sent_pos"], warns=totals["skipped_lines"], errs=totals["errors"])
@@ -791,7 +859,12 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
             except Exception as e:
                 totals["skipped_pos"] += 1
                 totals["errors"] += 1
-                force_keep_po_open(conn, po)
+
+                # Safety: ensure OPEN on any failure
+                try:
+                    force_keep_po_open(conn, po)
+                except Exception:
+                    pass
 
                 logging.exception(
                     f"PO {po}: send failed. {type(e).__name__}: {e} | Backup={backup_path or 'N/A'}"
