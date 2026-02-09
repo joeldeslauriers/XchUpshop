@@ -177,62 +177,101 @@ def purge_logs(log_dir: str, days_to_keep: int) -> int:
 
 
 # =============================================================================
-# Config (read once)
+# Config helpers (NO top-level raise)
 # =============================================================================
-config = configparser.ConfigParser()
-if not os.path.exists(CONFIG_PATH):
-    raise FileNotFoundError(f"config.ini not found: {CONFIG_PATH}")
-
-config.read(CONFIG_PATH, encoding="utf-8")
-
-LOG_PURGE_DAYS = config.getint("Settings", "LogPurge", fallback=30)
-
-server_name = (config.get("Settings", "ServerName", fallback="") or "").strip()
-if not server_name:
-    raise RuntimeError("Missing config.ini value: [Settings] ServerName")
-
-sql_driver = (config.get("Settings", "SQLDriver", fallback="SQL Server") or "SQL Server").strip()
-database = (config.get("Settings", "DatabaseName", fallback="STORESQL") or "STORESQL").strip()
-
-store_number_sms = int((config.get("Settings", "StoreNumber", fallback="0") or "0").strip() or "0")
-if store_number_sms <= 0:
-    raise RuntimeError(
-        "Config error: [Settings] StoreNumber must be > 0. "
-        "UNFI URL requires ?storeId=<StoreNumber> (ex: 3)."
-    )
-
-connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database};Trusted_Connection=yes"
-
-# UNFI shared settings
-UNFI_AUTH_URL = config.get("UNFI", "AuthUrl", fallback="").strip()
-UNFI_API_BASE = config.get("UNFI", "ApiBaseUrl", fallback="").strip().rstrip("/")
-UNFI_CHAIN_ID = config.get("UNFI", "ApiStoreChainId", fallback="").strip()
-
-UNFI_USERNAME = config.get("UNFI", "Username", fallback="").strip()
-UNFI_PASSWORD = config.get("UNFI", "Password", fallback="").strip().strip('"')
-UNFI_CLIENT_ID = config.get("UNFI", "ClientId", fallback="").strip()
-TIMEOUT_AUTH_SEC = config.getint("UNFI", "TimeoutAuthSec", fallback=90)
-TIMEOUT_POST_SEC = config.getint("UNFI", "TimeoutPostSec", fallback=120)
-
-missing = []
-if not UNFI_AUTH_URL:
-    missing.append("[UNFI] AuthUrl")
-if not UNFI_API_BASE:
-    missing.append("[UNFI] ApiBaseUrl")
-if not UNFI_CHAIN_ID:
-    missing.append("[UNFI] ApiStoreChainId")
-if not UNFI_USERNAME:
-    missing.append("[UNFI] Username")
-if not UNFI_PASSWORD:
-    missing.append("[UNFI] Password")
-if not UNFI_CLIENT_ID:
-    missing.append("[UNFI] ClientId")
-
-if missing:
-    raise RuntimeError("Missing config.ini value(s): " + ", ".join(missing))
+class ConfigError(Exception):
+    def __init__(self, message: str, missing: Optional[List[str]] = None):
+        super().__init__(message)
+        self.missing = missing or []
 
 
+def load_config_or_raise() -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    if not os.path.exists(CONFIG_PATH):
+        raise ConfigError(f"config.ini not found: {CONFIG_PATH}")
+    cfg.read(CONFIG_PATH, encoding="utf-8")
+    return cfg
+
+
+def validate_settings(cfg: configparser.ConfigParser) -> Dict[str, Any]:
+    """
+    Phase 1: Settings/DB only (so we can still write RAVYX_PO_STATUS on UNFI config errors)
+    """
+    log_purge_days = cfg.getint("Settings", "LogPurge", fallback=30)
+
+    server_name = (cfg.get("Settings", "ServerName", fallback="") or "").strip()
+    if not server_name:
+        raise ConfigError("Missing config.ini value: [Settings] ServerName")
+
+    sql_driver = (cfg.get("Settings", "SQLDriver", fallback="SQL Server") or "SQL Server").strip()
+    database = (cfg.get("Settings", "DatabaseName", fallback="STORESQL") or "STORESQL").strip()
+
+    store_number_sms = int((cfg.get("Settings", "StoreNumber", fallback="0") or "0").strip() or "0")
+    if store_number_sms <= 0:
+        raise ConfigError(
+            "Config error: [Settings] StoreNumber must be > 0. "
+            "UNFI URL requires ?storeId=<StoreNumber> (ex: 3)."
+        )
+
+    connection_string = f"DRIVER={{{sql_driver}}};SERVER={server_name};DATABASE={database};Trusted_Connection=yes"
+
+    return {
+        "LOG_PURGE_DAYS": log_purge_days,
+        "server_name": server_name,
+        "sql_driver": sql_driver,
+        "database": database,
+        "store_number_sms": store_number_sms,
+        "connection_string": connection_string,
+    }
+
+
+def validate_unfi(cfg: configparser.ConfigParser) -> Dict[str, Any]:
+    """
+    Phase 2: UNFI shared settings
+    """
+    UNFI_AUTH_URL = cfg.get("UNFI", "AuthUrl", fallback="").strip()
+    UNFI_API_BASE = cfg.get("UNFI", "ApiBaseUrl", fallback="").strip().rstrip("/")
+    UNFI_CHAIN_ID = cfg.get("UNFI", "ApiStoreChainId", fallback="").strip()
+
+    UNFI_USERNAME = cfg.get("UNFI", "Username", fallback="").strip()
+    UNFI_PASSWORD = cfg.get("UNFI", "Password", fallback="").strip().strip('"')
+    UNFI_CLIENT_ID = cfg.get("UNFI", "ClientId", fallback="").strip()
+
+    TIMEOUT_AUTH_SEC = cfg.getint("UNFI", "TimeoutAuthSec", fallback=90)
+    TIMEOUT_POST_SEC = cfg.getint("UNFI", "TimeoutPostSec", fallback=120)
+
+    missing: List[str] = []
+    if not UNFI_AUTH_URL:
+        missing.append("[UNFI] AuthUrl")
+    if not UNFI_API_BASE:
+        missing.append("[UNFI] ApiBaseUrl")
+    if not UNFI_CHAIN_ID:
+        missing.append("[UNFI] ApiStoreChainId")
+    if not UNFI_USERNAME:
+        missing.append("[UNFI] Username")
+    if not UNFI_PASSWORD:
+        missing.append("[UNFI] Password")
+    if not UNFI_CLIENT_ID:
+        missing.append("[UNFI] ClientId")
+
+    if missing:
+        raise ConfigError("Missing config.ini value(s): " + ", ".join(missing), missing=missing)
+
+    return {
+        "UNFI_AUTH_URL": UNFI_AUTH_URL,
+        "UNFI_API_BASE": UNFI_API_BASE,
+        "UNFI_CHAIN_ID": UNFI_CHAIN_ID,
+        "UNFI_USERNAME": UNFI_USERNAME,
+        "UNFI_PASSWORD": UNFI_PASSWORD,
+        "UNFI_CLIENT_ID": UNFI_CLIENT_ID,
+        "TIMEOUT_AUTH_SEC": TIMEOUT_AUTH_SEC,
+        "TIMEOUT_POST_SEC": TIMEOUT_POST_SEC,
+    }
+
+
+# =============================================================================
 # Second validation to not export order for other vendor than UNFI
+# =============================================================================
 def vendor_section_from_f27(vendor_id: int) -> str:
     if vendor_id == 3954:
         return "UNFIGW"
@@ -241,34 +280,34 @@ def vendor_section_from_f27(vendor_id: int) -> str:
     raise ValueError(f"Unsupported UNFI vendor id (F27): {vendor_id}")
 
 
-def read_vendor_cfg(vendor_id: int) -> Dict[str, str]:
+def read_vendor_cfg(cfg: configparser.ConfigParser, vendor_id: int) -> Dict[str, str]:
     sect = vendor_section_from_f27(vendor_id)
-    if sect not in config:
-        raise RuntimeError(f"Missing config.ini section: [{sect}] for vendor {vendor_id}")
+    if sect not in cfg:
+        raise ConfigError(f"Missing config.ini section: [{sect}] for vendor {vendor_id}")
 
     for k in ("SupplierName", "AccountNumber", "StoreID"):
-        if not (config[sect].get(k, "") or "").strip():
-            raise RuntimeError(f"Missing config.ini value: [{sect}] {k}")
+        if not (cfg[sect].get(k, "") or "").strip():
+            raise ConfigError(f"Missing config.ini value: [{sect}] {k}")
 
-    store_id_raw = (config[sect]["StoreID"] or "").strip().strip('"')
+    store_id_raw = (cfg[sect]["StoreID"] or "").strip().strip('"')
     if not store_id_raw.isdigit():
-        raise RuntimeError(f"Invalid config.ini value: [{sect}] StoreID must be numeric. Got: {store_id_raw!r}")
+        raise ConfigError(f"Invalid config.ini value: [{sect}] StoreID must be numeric. Got: {store_id_raw!r}")
 
     return {
-        "SupplierId": (config[sect].get("SupplierId", str(vendor_id)) or str(vendor_id)).strip(),
-        "SupplierName": config[sect]["SupplierName"].strip(),
-        "AccountNumber": config[sect]["AccountNumber"].strip(),
-        "StoreID": store_id_raw,  # UNFI storeID inside payload header.storeID
+        "SupplierId": (cfg[sect].get("SupplierId", str(vendor_id)) or str(vendor_id)).strip(),
+        "SupplierName": cfg[sect]["SupplierName"].strip(),
+        "AccountNumber": cfg[sect]["AccountNumber"].strip(),
+        "StoreID": store_id_raw,
         "Section": sect,
     }
 
 
-def build_unfi_order_url(vendor_cfg: Dict[str, str]) -> str:
+def build_unfi_order_url(unfi_api_base: str, unfi_chain_id: str, store_number_sms: int, vendor_cfg: Dict[str, str]) -> str:
     """
     POST https://posapi.../stores/{chainId}/orders?storeId={SMS StoreNumber}
     """
-    chain_id = int(UNFI_CHAIN_ID)
-    return f"{UNFI_API_BASE}/stores/{chain_id}/orders?storeId={int(store_number_sms)}"
+    chain_id = int(unfi_chain_id)
+    return f"{unfi_api_base}/stores/{chain_id}/orders?storeId={int(store_number_sms)}"
 
 
 # =============================================================================
@@ -778,7 +817,6 @@ def build_unfi_payload(
         return None, "", 0, 0, "No REC_REG rows found for this PO.", {}
 
     todays_date = datetime.now().strftime("%Y-%m-%dT%H:%M")
-
     unique_order_id = str(uuid.uuid4())
 
     valid = 0
@@ -802,7 +840,6 @@ def build_unfi_payload(
             fallback_total += float(r.COST)
 
     used_total = rec_ttl_total if rec_ttl_total is not None else fallback_total
-
     unfi_store_id = int(vendor_cfg["StoreID"])
 
     payload = {
@@ -857,30 +894,32 @@ def build_unfi_payload(
     if not payload["details"]:
         return None, unique_order_id, valid, skipped, "No valid lines to send (payload empty).", skip_map
 
-    msg = f"orderTotal REC_TTL(F1034=8201)={rec_ttl_total} | fallback(sum valid cost*qty)={fallback_total} | used={used_total}"
+    msg = (
+        f"orderTotal REC_TTL(F1034=8201)={rec_ttl_total} | "
+        f"fallback(sum valid cost*qty)={fallback_total} | used={used_total}"
+    )
     logging.info(f"PO {po_number}: {msg}")
     return payload, unique_order_id, valid, skipped, msg, skip_map
 
 
 # =============================================================================
-# Auth / Send
+# Auth / Send (now takes config dict)
 # =============================================================================
-def get_unfi_token(session: Session) -> str:
-    url = UNFI_AUTH_URL
+def get_unfi_token(session: Session, *, auth_url: str, client_id: str, username: str, password: str, timeout_sec: int) -> str:
     headers = {"Content-Type": "application/json"}
-    req = {"client_id": UNFI_CLIENT_ID, "username": UNFI_USERNAME, "password": UNFI_PASSWORD}
+    req = {"client_id": client_id, "username": username, "password": password}
 
     t0 = time.perf_counter()
-    resp = session.post(url, headers=headers, json=req, timeout=TIMEOUT_AUTH_SEC)
+    resp = session.post(auth_url, headers=headers, json=req, timeout=timeout_sec)
     elapsed = time.perf_counter() - t0
 
     _write_unfi_api_log(
         kind="AUTH",
-        url=url,
+        url=auth_url,
         status_code=getattr(resp, "status_code", 0) or 0,
         elapsed_s=elapsed,
         headers=headers,
-        request_json={"client_id": UNFI_CLIENT_ID, "username": UNFI_USERNAME, "password": "***"},
+        request_json={"client_id": client_id, "username": username, "password": "***"},
         response_text=getattr(resp, "text", "") or "",
         po_number=None,
     )
@@ -896,19 +935,24 @@ def get_unfi_token(session: Session) -> str:
     return token
 
 
-def post_unfi_order(session: Session, token: str, payload: Dict[str, Any], vendor_cfg: Dict[str, str]) -> requests.Response:
-    url = build_unfi_order_url(vendor_cfg)
+def post_unfi_order(
+    session: Session,
+    *,
+    order_url: str,
+    token: str,
+    payload: Dict[str, Any],
+    timeout_sec: int,
+) -> requests.Response:
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
     po_number = str((payload.get("header") or {}).get("storePONumber") or "?")
 
     t0 = time.perf_counter()
-    resp = session.post(url, headers=headers, json=payload, timeout=TIMEOUT_POST_SEC)
+    resp = session.post(order_url, headers=headers, json=payload, timeout=timeout_sec)
     elapsed = time.perf_counter() - t0
 
     _write_unfi_api_log(
         kind="ORDER",
-        url=url,
+        url=order_url,
         status_code=resp.status_code,
         elapsed_s=elapsed,
         headers={"Content-Type": "application/json", "Authorization": headers["Authorization"]},
@@ -956,34 +1000,87 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
     conn: Optional[pyodbc.Connection] = None
     unfi_guid: str = ""
 
+    cfg: Optional[configparser.ConfigParser] = None
+    settings: Dict[str, Any] = {}
+    unfi: Dict[str, Any] = {}
+
     try:
         logging.info("=== Start run (UNFIPush) ===")
         logging.info(f"AppVersion={APP_VERSION} | Frozen={_is_frozen()} | BaseDir={BASE_DIR}")
         logging.info(f"ConfigPath={CONFIG_PATH}")
 
-        try:
-            deleted = purge_logs(LOG_DIR, LOG_PURGE_DAYS)
-            logging.info(f"Log purge: deleted {deleted} file(s) older than {LOG_PURGE_DAYS} day(s).")
-        except Exception as e:
-            logging.warning(f"Log purge failed: {e}")
-
+        # Get SQI args early (so we can report PO/vendor in status rows)
         po, vendor = get_sqi_args()
 
         ui_summary("INFO", "Starting…")
         ui_summary("INFO", f"Preparing PO {po}…")
 
-        vendor_cfg = read_vendor_cfg(vendor)
-        order_url = build_unfi_order_url(vendor_cfg)
+        # Load config (safe)
+        cfg = load_config_or_raise()
+
+        # Validate Settings first (DB path)
+        settings = validate_settings(cfg)
+
+        # Purge logs now that we have LOG_PURGE_DAYS
+        try:
+            deleted = purge_logs(LOG_DIR, int(settings["LOG_PURGE_DAYS"]))
+            logging.info(f"Log purge: deleted {deleted} file(s) older than {settings['LOG_PURGE_DAYS']} day(s).")
+        except Exception as e:
+            logging.warning(f"Log purge failed: {e}")
+
+        # Connect DB as early as possible to be able to write RAVYX_PO_STATUS on config errors
+        conn = pyodbc.connect(settings["connection_string"])
+        vendor_name = get_vendor_name(conn, vendor)
+        rec_hdr_f91 = get_rec_hdr_f91(conn, str(po))
+
+        # Validate UNFI (if fails => UI + RAVYX + OPEN)
+        try:
+            unfi = validate_unfi(cfg)
+        except ConfigError as ce:
+            msg = str(ce)
+            logging.error(msg)
+            ui_summary("ERROR", msg)
+            ui_counters(sent=0, warns=0, errs=1)
+            ui_autoclose(25)
+
+            try:
+                insert_ravyx_po_status(
+                    conn,
+                    po_number=str(po),
+                    vendor=vendor,
+                    vendor_name=vendor_name,
+                    status="FAILED",
+                    f1081_text=_truncate_5000(f"CONFIG error: {msg}"),
+                    dept=None,
+                    rec_hdr_f91=rec_hdr_f91,
+                    process="Order Export",
+                )
+            except Exception as e:
+                logging.warning(f"Unable to insert RAVYX_PO_STATUS for config error: {e}")
+
+            try:
+                force_keep_po_open_on_failure(conn, str(po))
+            except Exception:
+                pass
+
+            return 2
+
+        # Vendor-specific config
+        vendor_cfg = read_vendor_cfg(cfg, vendor)
+
+        # Build endpoint URL
+        order_url = build_unfi_order_url(
+            unfi_api_base=unfi["UNFI_API_BASE"],
+            unfi_chain_id=unfi["UNFI_CHAIN_ID"],
+            store_number_sms=int(settings["store_number_sms"]),
+            vendor_cfg=vendor_cfg,
+        )
 
         logging.info(
             f"UNFI endpoint (POST) = {order_url} | "
-            f"storeId(query)=StoreNumber={store_number_sms} | "
+            f"storeId(query)=StoreNumber={settings['store_number_sms']} | "
             f"payload header.storeID(UNFI)={vendor_cfg['StoreID']}"
         )
-
-        conn = pyodbc.connect(connection_string)
-        vendor_name = get_vendor_name(conn, vendor)
-        rec_hdr_f91 = get_rec_hdr_f91(conn, str(po))
 
         # Prevent duplicate sends (fail-closed).
         if safe_has_existing_guid(conn, str(po)):
@@ -1053,10 +1150,17 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
         # Auth
         try:
             ui_summary("INFO", "Connecting…")
-            token = get_unfi_token(session)
+            token = get_unfi_token(
+                session,
+                auth_url=unfi["UNFI_AUTH_URL"],
+                client_id=unfi["UNFI_CLIENT_ID"],
+                username=unfi["UNFI_USERNAME"],
+                password=unfi["UNFI_PASSWORD"],
+                timeout_sec=int(unfi["TIMEOUT_AUTH_SEC"]),
+            )
             ui_summary("INFO", "Connected.")
         except (ConnectionError, Timeout, HTTPError, RequestException) as e:
-            title, detail = format_requests_error(e, UNFI_AUTH_URL)
+            title, detail = format_requests_error(e, unfi["UNFI_AUTH_URL"])
             logging.exception(f"Auth/network error: {e}")
 
             ui_summary("ERROR", f"Connection failed: {title}")
@@ -1079,13 +1183,32 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
         # Post (with 401/403 refresh once)
         try:
             ui_summary("INFO", f"Sending PO {po}…")
-            resp = post_unfi_order(session, token, payload, vendor_cfg)
+            resp = post_unfi_order(
+                session,
+                order_url=order_url,
+                token=token,
+                payload=payload,
+                timeout_sec=int(unfi["TIMEOUT_POST_SEC"]),
+            )
 
             if resp.status_code in (401, 403):
                 logging.warning("Received 401/403. Refreshing token and retrying once…")
                 ui_summary("WARN", "Token expired. Retrying…")
-                token = get_unfi_token(session)
-                resp = post_unfi_order(session, token, payload, vendor_cfg)
+                token = get_unfi_token(
+                    session,
+                    auth_url=unfi["UNFI_AUTH_URL"],
+                    client_id=unfi["UNFI_CLIENT_ID"],
+                    username=unfi["UNFI_USERNAME"],
+                    password=unfi["UNFI_PASSWORD"],
+                    timeout_sec=int(unfi["TIMEOUT_AUTH_SEC"]),
+                )
+                resp = post_unfi_order(
+                    session,
+                    order_url=order_url,
+                    token=token,
+                    payload=payload,
+                    timeout_sec=int(unfi["TIMEOUT_POST_SEC"]),
+                )
 
         except (ConnectionError, Timeout, HTTPError, RequestException) as e:
             title, detail = format_requests_error(e, order_url)
@@ -1115,7 +1238,6 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
             order_id = _extract_order_id(resp)
 
             try:
-                # FIX: atomic CLOSE + GUID
                 mark_po_sent_and_store_guid(conn, str(po), unfi_guid)
             except Exception as e:
                 msg = _truncate_5000(f"Submitted OK but failed to update REC_HDR (CLOSE+GUID): {e}")
@@ -1189,16 +1311,41 @@ def run_job(ui_q: Optional["queue.Queue"] = None) -> int:
 
     except Exception as e:
         logging.exception(f"Fatal error: {e}")
+
         if ui_q is not None:
-            ui_q.put(("SUMMARY", "ERROR", f"Fatal error: {type(e).__name__}"))
+            ui_q.put(("SUMMARY", "ERROR", f"Fatal error: {type(e).__name__}: {e}"))
             ui_q.put(("COUNTERS", "ERRORS", "1"))
-            ui_q.put(("AUTOCLOSE", "20", ""))
+            ui_q.put(("AUTOCLOSE", "25", ""))
+
+        # Try to write FAILED to status report if DB is open
+        try:
+            if conn is not None and po:
+                vn = None
+                try:
+                    vn = get_vendor_name(conn, vendor)
+                except Exception:
+                    vn = None
+
+                insert_ravyx_po_status(
+                    conn,
+                    po_number=str(po),
+                    vendor=vendor,
+                    vendor_name=vn,
+                    status="FAILED",
+                    f1081_text=_truncate_5000(f"Fatal error: {type(e).__name__}: {e}"),
+                    dept=None,
+                    rec_hdr_f91=get_rec_hdr_f91(conn, str(po)),
+                    process="Order Export",
+                )
+        except Exception as dbex:
+            logging.warning(f"Unable to insert RAVYX_PO_STATUS for fatal error: {dbex}")
 
         try:
             if conn is not None and po:
                 force_keep_po_open_on_failure(conn, str(po))
         except Exception:
             pass
+
         return 2
 
     finally:

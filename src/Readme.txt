@@ -77,6 +77,15 @@ pyinstaller --noconfirm --clean --onefile --windowed `
   --version-file src\drivers\push_sms_po_to_unfi\version_info.txt `
   src\drivers\push_sms_po_to_unfi\main.py
 
+ONEDIR
+  pyinstaller --noconfirm --clean --onedir --windowed `
+  --name pushSMSPOtoUNFI `
+  --paths src `
+  --version-file src\drivers\push_sms_po_to_unfi\version_info.txt `
+  --collect-all tkinter `
+  src\drivers\push_sms_po_to_unfi\main.py
+
+
 
 ========================================
 pushSMSPOtoLipari
