@@ -32,6 +32,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version='src\\drivers\\import_orders_into_sms\\version_info.txt',
 )
 coll = COLLECT(
     exe,

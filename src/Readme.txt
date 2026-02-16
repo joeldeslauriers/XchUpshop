@@ -44,7 +44,9 @@ pyinstaller --noconfirm --clean --onedir --windowed `
   --paths src `
   --hidden-import shared `
   --hidden-import shared.http_errors `
+  --version-file src\drivers\import_orders_into_sms\version_info.txt `
   src\drivers\import_orders_into_sms\main.py
+
 
 
 ========================================
@@ -65,7 +67,6 @@ pyinstaller --noconfirm --clean --onedir --windowed `
   --version-file src\drivers\push_sms_po_to_maceri\version_info.txt `
   src\drivers\push_sms_po_to_maceri\main.py
 
-
 ========================================
 pushSMSPOtoUNFI
 ========================================
@@ -78,8 +79,8 @@ pyinstaller --noconfirm --clean --onefile --windowed `
   src\drivers\push_sms_po_to_unfi\main.py
 
 ONEDIR
-  pyinstaller --noconfirm --clean --onedir --windowed `
-  --name pushSMSPOtoUNFI `
+pyinstaller --noconfirm --clean --onedir --windowed `
+  --name PushSMSPOtoUNFI `
   --paths src `
   --version-file src\drivers\push_sms_po_to_unfi\version_info.txt `
   --collect-all tkinter `
@@ -102,12 +103,11 @@ pyinstaller --noconfirm --clean --onefile --windowed `
 
 ONEDIR (RECOMMANDÉ)
 pyinstaller --noconfirm --clean --onedir --windowed `
-  --name pushSMSPOtoLipari `
+  --name PushSMSPOtoLipari `
   --paths src `
   --hidden-import ui_send_PO_Lipari `
   --version-file src\drivers\push_sms_po_to_lipari\version_info.txt `
   src\drivers\push_sms_po_to_lipari\main.py
-
 
 ========================================
 GetSPSInvoices

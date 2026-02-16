@@ -5,7 +5,7 @@ a = Analysis(
     ['src\\drivers\\push_sms_po_to_maceri\\main.py'],
     pathex=['src'],
     binaries=[],
-    datas=[('src\\drivers\\push_sms_po_to_maceri\\version_info.txt', '.')],
+    datas=[],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

@@ -960,7 +960,8 @@ def worker(ui_q: Queue):
         po, vendor, force_send = get_sqi_args()
         logging.info(f"SQI args: PO={po} Vendor={vendor} Force={force_send}")
 
-        ui("INFO", f"Starting Maceri Push v{APP_VERSION}", "")
+        # NO VERSION IN UI:
+        ui("INFO", "Starting Maceri Push", "")
         ui("INFO", "SQI Parameters", f"PO={po} | Vendor={vendor} | Force={force_send}")
         ui("INFO", "Loading config.ini...", os.path.basename(CONFIG_PATH))
 
@@ -1272,7 +1273,8 @@ def worker(ui_q: Queue):
 def main():
     ui_q = Queue()
     ui = VendorSendUI(
-        title=f"PLUM – Send PO to Maceri v{APP_VERSION}",
+        # NO VERSION IN WINDOW TITLE:
+        title="PLUM – Send PO to Maceri",
         queue=ui_q,
         auto_close_seconds=AUTO_CLOSE_SECONDS,
     )

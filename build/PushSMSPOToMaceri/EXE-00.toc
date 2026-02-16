@@ -3,7 +3,7 @@
  False,
  True,
  'C:\\XchUpshop\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\images\\icon-windowed.ico',
- versioninfo.VSVersionInfo(ffi=versioninfo.FixedFileInfo(filevers=(0, 0, 0, 1), prodvers=(0, 0, 0, 1), mask=0x3f, flags=0x0, OS=0x40004, fileType=1, subtype=0x0, date=(0, 0)), kids=[versioninfo.StringFileInfo([versioninfo.StringTable('040904B0', [versioninfo.StringStruct('CompanyName', 'Ravyx'), versioninfo.StringStruct('LegalCopyright', 'Tous droits réservés © Ravyx'), versioninfo.StringStruct('FileDescription', 'Export SMS order to Maceri'), versioninfo.StringStruct('FileVersion', '0.0.0.1'), versioninfo.StringStruct('InternalName', 'PushSMSPOToMaceri'), versioninfo.StringStruct('OriginalFilename', 'PushSMSPOToMaceri.exe'), versioninfo.StringStruct('ProductName', 'PushSMSPOToMaceri'), versioninfo.StringStruct('ProductVersion', '0.0.0.1')])]), versioninfo.VarFileInfo([versioninfo.VarStruct('Translation', [1033, 1200])])]),
+ versioninfo.VSVersionInfo(ffi=versioninfo.FixedFileInfo(filevers=(1, 0, 0, 0), prodvers=(1, 0, 0, 0), mask=0x3f, flags=0x0, OS=0x40004, fileType=1, subtype=0x0, date=(0, 0)), kids=[versioninfo.StringFileInfo([versioninfo.StringTable('040904B0', [versioninfo.StringStruct('CompanyName', 'Ravyx'), versioninfo.StringStruct('LegalCopyright', 'Tous droits réservés © Ravyx'), versioninfo.StringStruct('FileDescription', 'Export SMS order to Maceri'), versioninfo.StringStruct('FileVersion', '1.0.0.0'), versioninfo.StringStruct('InternalName', 'PushSMSPOToMaceri'), versioninfo.StringStruct('OriginalFilename', 'PushSMSPOToMaceri.exe'), versioninfo.StringStruct('ProductName', 'PushSMSPOToMaceri'), versioninfo.StringStruct('ProductVersion', '1.0.0.0')])]), versioninfo.VarFileInfo([versioninfo.VarStruct('Translation', [1033, 1200])])]),
  False,
  False,
  b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<assembly xmlns='
@@ -71,7 +71,7 @@
  [],
  False,
  False,
- 1770381645,
+ 1771270661,
  [('runw.exe',
    'C:\\XchUpshop\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe',
    'EXECUTABLE')],
