@@ -1,23 +1,22 @@
 import argparse
+import configparser
 import json
 import logging
 import os
-import queue
 import sys
-import threading
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-import configparser
 import pyodbc
 import requests
 
-from ui_getSPSInvoices import GetSpsInvoicesUI as VendorSendUI
-
+# =============================================================================
+# No UI (scheduled task friendly)
+# =============================================================================
 
 # =============================================================================
-# Path helpers 
+# Path helpers
 # =============================================================================
 def _is_frozen() -> bool:
     return getattr(sys, "frozen", False)
@@ -29,7 +28,6 @@ def _base_dir() -> str:
 
 BASE_DIR = _base_dir()
 CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
-
 
 # =============================================================================
 # Logging setup (file + console)
@@ -56,29 +54,10 @@ def setup_logging() -> None:
     root.addHandler(fh)
     root.addHandler(ch)
 
+    logging.info("=== Start run ===")
     logging.info(f"Frozen={_is_frozen()} | BASE_DIR={BASE_DIR} | CWD={os.getcwd()}")
     logging.info(f"CONFIG_PATH={CONFIG_PATH}")
     logging.info(f"LOG_FILE={log_filename}")
-
-
-# =============================================================================
-# UI helper (summary-only UI, full details in log)
-# =============================================================================
-def ui_summary(q: Optional["queue.Queue"], level: str, msg: str, detail: str = "") -> None:
-    lvl = (level or "INFO").upper()
-    m = (msg or "").strip()
-    d = (detail or "").strip()
-
-    line = f"{m} | {d}" if d else m
-    if lvl in ("ERROR", "CRITICAL"):
-        logging.error(line)
-    elif lvl in ("WARN", "WARNING"):
-        logging.warning(line)
-    else:
-        logging.info(line)
-
-    if q is not None:
-        q.put((lvl, m, d))
 
 
 def log_info(msg: str) -> None:
@@ -118,7 +97,6 @@ def request_with_retry(
     *,
     tries: int = 3,
     base_sleep: float = 1.0,
-    ui_q: Optional["queue.Queue"] = None,
     what: str = "HTTP",
 ):
     last = None
@@ -129,8 +107,6 @@ def request_with_retry(
             last = e
             log_warn(f"{what} failed (try {i}/{tries}): {type(e).__name__}: {e}")
             if i < tries:
-                if ui_q is not None:
-                    ui_summary(ui_q, "WARN", f"{what} retrying...", f"Attempt {i+1}/{tries}")
                 time.sleep(base_sleep * i)
             else:
                 raise last
@@ -140,168 +116,357 @@ def _is_uuid_like(s: str) -> bool:
     s = (s or "").strip()
     if len(s) != 36:
         return False
-    # very light validation (avoid adding uuid import)
-    return (
-        s.count("-") == 4
-        and all(c.isalnum() or c == "-" for c in s)
+    return s.count("-") == 4 and all(c.isalnum() or c == "-" for c in s)
+
+
+def _clip(s: Any, n: int) -> str:
+    return ("" if s is None else str(s)).strip()[:n]
+
+
+def _safe_int(v: Any, default: int = 0) -> int:
+    try:
+        if v is None or v == "":
+            return default
+        return int(v)
+    except Exception:
+        return default
+
+
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    try:
+        if v is None or v == "":
+            return default
+        return float(v)
+    except Exception:
+        return default
+
+
+# =============================================================================
+# RAVYX_PO_STATUS (minimal writer - keeps your report populated)
+# =============================================================================
+def upsert_po_status(
+    conn,
+    *,
+    f91: str,
+    f27: str,
+    step: str,
+    vendor_name: str = "",
+    status_txt: str = "SUCCESS",
+    message: str = "",
+    dept: Optional[int] = None,
+    f1032: int = 0,
+):
+    """
+    Uses MERGE to update/insert dbo.RAVYX_PO_STATUS.
+    Note: For SUCCESS, we store NULL in F1081 (message) to keep it clean.
+    """
+    f91 = _clip(f91, 20)
+    f27 = _clip(f27, 14)
+    step = _clip(step, 40)
+    vendor_name = _clip(vendor_name, 60)
+    status_txt = _clip(status_txt, 60)
+
+    msg_db = None if (status_txt or "").strip().upper() == "SUCCESS" else _clip(message, 5000)
+    now = datetime.now()
+    dept_i = None if dept is None else _safe_int(dept, 0)
+    f1032_i = _safe_int(f1032, 0)
+
+    sql = """
+    MERGE dbo.RAVYX_PO_STATUS AS T
+    USING (SELECT ? AS F91, ? AS F27) AS S
+      ON (T.F91 = S.F91 AND T.F27 = S.F27)
+    WHEN MATCHED THEN
+      UPDATE SET
+        T.F254  = ?,
+        T.F02   = ?,
+        T.F29   = ?,
+        T.F1081 = ?,
+        T.F334  = ?,
+        T.F03   = COALESCE(?, T.F03),
+        T.F1032 = CASE WHEN (T.F1032 IS NULL OR T.F1032 = 0) THEN ? ELSE T.F1032 END
+    WHEN NOT MATCHED THEN
+      INSERT (F1032, F91, F02, F27, F334, F254, F29, F1081, F03)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+    params = (
+        f91,
+        f27,
+        now,
+        step,
+        status_txt,
+        msg_db,
+        vendor_name,
+        dept_i,
+        f1032_i,
+        f1032_i,
+        f91,
+        step,
+        f27,
+        vendor_name,
+        now,
+        status_txt,
+        msg_db,
+        dept_i,
     )
 
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    conn.commit()
+    cur.close()
+
 
 # =============================================================================
-# Worker
+# Config parsing
 # =============================================================================
-def worker(args, ui_q: "queue.Queue") -> None:
+def load_config(path: str) -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    read_ok = cfg.read(path, encoding="utf-8")
+    if not read_ok:
+        raise FileNotFoundError(f"config.ini not loaded. Path={path}")
+    return cfg
+
+
+def load_unfi_vendors(cfg: configparser.ConfigParser) -> Dict[str, Dict[str, str]]:
+    """
+    Reads any section that starts with UNFI (ex: [UNFIGW], [UNFIRC], [UNFIVendor123])
+    Requires at least SupplierId and StoreID.
+    Returns dict keyed by SupplierId (F27) -> {supplier_id, supplier_name, account_number, store_id, section}
+    """
+    out: Dict[str, Dict[str, str]] = {}
+    for sec in cfg.sections():
+        if not sec.upper().startswith("UNFI"):
+            continue
+        if sec.upper() == "UNFI":
+            continue  # generic auth/api section
+
+        supplier_id = (cfg.get(sec, "SupplierId", fallback="") or "").strip()
+        supplier_name = (cfg.get(sec, "SupplierName", fallback=sec) or "").strip()
+        account_number = (cfg.get(sec, "AccountNumber", fallback="") or "").strip()
+        store_id = (cfg.get(sec, "StoreID", fallback="") or "").strip()
+
+        if not supplier_id:
+            continue
+        if not store_id or not store_id.isdigit():
+            continue
+
+        out[supplier_id] = {
+            "supplier_id": supplier_id,
+            "supplier_name": supplier_name,
+            "account_number": account_number,
+            "store_id": store_id,
+            "section": sec,
+        }
+    return out
+
+
+# =============================================================================
+# Main job
+# =============================================================================
+def run_job(args) -> int:
     start = time.perf_counter()
 
-    config = configparser.ConfigParser()
-    read_ok = config.read(CONFIG_PATH, encoding="utf-8")
-    log_info(f"Config loaded={bool(read_ok)} | sections={config.sections()}")
+    cfg = load_config(CONFIG_PATH)
+    log_info(f"Config loaded | sections={cfg.sections()}")
 
-    if "Settings" not in config:
-        ui_summary(ui_q, "ERROR", "Config error", "config.ini missing [Settings] or not loaded.")
-        ui_summary(ui_q, "DONE", "Done", "Processed OK=0 | Failed=0 | Total=0")
-        return
+    if "Settings" not in cfg:
+        raise RuntimeError("config.ini missing [Settings]")
 
-    # Settings
-    SERVER_NAME = config["Settings"]["ServerName"]
-    SQL_DRIVER = config["Settings"].get("SQLDriver", "SQL Server")
-    DB_NAME = config["Settings"].get("DatabaseName", "STORESQL")
-    STORE_NUMBER = int(config["Settings"].get("StoreNumber", "0") or "0")  # SMS store number (ex: 3)
+    SERVER_NAME = (cfg.get("Settings", "ServerName", fallback="") or "").strip()
+    SQL_DRIVER = (cfg.get("Settings", "SQLDriver", fallback="SQL Server") or "SQL Server").strip()
+    DB_NAME = (cfg.get("Settings", "DatabaseName", fallback="STORESQL") or "STORESQL").strip()
+    STORE_NUMBER = _safe_int(cfg.get("Settings", "StoreNumber", fallback="0"), 0)
 
-    # UNFI
-    if "UNFI" not in config:
-        ui_summary(ui_q, "ERROR", "Config error", "config.ini missing [UNFI].")
-        ui_summary(ui_q, "DONE", "Done", "Processed OK=0 | Failed=0 | Total=0")
-        return
+    if not SERVER_NAME:
+        raise RuntimeError("Settings.ServerName is empty")
 
-    UNFI_AUTH_URL = config["UNFI"]["AuthUrl"].strip()
-    UNFI_CLIENT_ID = config["UNFI"]["ClientId"].strip()
-    UNFI_USERNAME = config["UNFI"]["Username"].strip()
-    UNFI_PASSWORD = config["UNFI"]["Password"].strip().strip('"')
-    UNFI_TIMEOUT_AUTH = int(config["UNFI"].get("TimeoutAuthSec", "90"))
+    # UNFI generic
+    if "UNFI" not in cfg:
+        raise RuntimeError("config.ini missing [UNFI] (generic UNFI auth/api settings)")
 
-    UNFI_API_BASE = config["UNFI"]["ApiBaseUrl"].strip().rstrip("/")
+    UNFI_AUTH_URL = (cfg.get("UNFI", "AuthUrl", fallback="") or "").strip()
+    UNFI_CLIENT_ID = (cfg.get("UNFI", "ClientId", fallback="") or "").strip()
+    UNFI_USERNAME = (cfg.get("UNFI", "Username", fallback="") or "").strip()
+    UNFI_PASSWORD = (cfg.get("UNFI", "Password", fallback="") or "").strip().strip('"')
+    UNFI_TIMEOUT_AUTH = _safe_int(cfg.get("UNFI", "TimeoutAuthSec", fallback="90"), 90)
+    UNFI_API_BASE = (cfg.get("UNFI", "ApiBaseUrl", fallback="") or "").strip().rstrip("/")
 
-
-    # GET uses the UNFI StoreID (ex: 127705).
-    UNFI_ORDERS_STORE_ID = config["UNFI"].get("OrdersStoreId", "").strip().strip('"')
-
-    if not UNFI_ORDERS_STORE_ID or not UNFI_ORDERS_STORE_ID.isdigit():
-        ui_summary(
-            ui_q,
-            "ERROR",
-            "Config error",
-            "Missing/invalid [UNFI] OrdersStoreId (expected numeric like 127705) used for GET URL path.",
-        )
-        ui_summary(ui_q, "DONE", "Done", "Processed OK=0 | Failed=0 | Total=0")
-        return
+    if not (UNFI_AUTH_URL and UNFI_CLIENT_ID and UNFI_USERNAME and UNFI_PASSWORD and UNFI_API_BASE):
+        raise RuntimeError("UNFI settings incomplete (AuthUrl/ClientId/Username/Password/ApiBaseUrl)")
 
     # Invafresh
-    if "GetSpsInvoice" not in config:
-        ui_summary(ui_q, "ERROR", "Config error", "config.ini missing [GetSpsInvoice].")
-        ui_summary(ui_q, "DONE", "Done", "Processed OK=0 | Failed=0 | Total=0")
-        return
+    if "GetSpsInvoice" not in cfg:
+        raise RuntimeError("config.ini missing [GetSpsInvoice]")
 
-    INV_BASE = config["GetSpsInvoice"]["BaseUrl"].strip().rstrip("/")
-    INV_USER = config["GetSpsInvoice"]["Username"].strip()
-    INV_PASS = config["GetSpsInvoice"]["Password"].strip()
+    INV_BASE = (cfg.get("GetSpsInvoice", "BaseUrl", fallback="") or "").strip().rstrip("/")
+    INV_USER = (cfg.get("GetSpsInvoice", "Username", fallback="") or "").strip()
+    INV_PASS = (cfg.get("GetSpsInvoice", "Password", fallback="") or "").strip()
+
+    if not (INV_BASE and INV_USER and INV_PASS):
+        raise RuntimeError("GetSpsInvoice settings incomplete (BaseUrl/Username/Password)")
 
     INV_LOGIN_URL = f"{INV_BASE}/login"
     INV_RECEIPTS_URL = f"{INV_BASE}/backroom_products/receipt_transactions"
 
+    # UNFI vendors
+    unfi_vendors = load_unfi_vendors(cfg)
+    if not unfi_vendors:
+        raise RuntimeError(
+            "No UNFI vendor sections found. Add [UNFIGW]/[UNFIRC]/[UNFIVendorX] with SupplierId+StoreID"
+        )
+
+    vendors_to_process: Dict[str, Dict[str, str]] = {}
+    if args.f27:
+        if args.f27 not in unfi_vendors:
+            raise RuntimeError(
+                f"Vendor {args.f27} not found in UNFI vendor sections. Add section like [UNFIVendor...] SupplierId={args.f27}"
+            )
+        vendors_to_process[args.f27] = unfi_vendors[args.f27]
+    else:
+        vendors_to_process = unfi_vendors
+
     log_info(f"SQL: {SERVER_NAME}\\{DB_NAME} (Driver={SQL_DRIVER}) StoreNumber(SMS)={STORE_NUMBER}")
-    log_info(f"UNFI AuthUrl={UNFI_AUTH_URL}")
-    log_info(f"UNFI ApiBaseUrl={UNFI_API_BASE} OrdersStoreId(GET path)={UNFI_ORDERS_STORE_ID!r}")
+    log_info(f"UNFI ApiBaseUrl={UNFI_API_BASE}")
     log_info(f"Invafresh BaseUrl={INV_BASE}")
+    log_info(f"UNFI vendors configured: {', '.join(sorted(vendors_to_process.keys()))}")
 
     # --- SQL helpers ---
     def _get_conn() -> pyodbc.Connection:
         conn_str = f"DRIVER={{{SQL_DRIVER}}};SERVER={SERVER_NAME};DATABASE={DB_NAME};Trusted_Connection=yes"
         return pyodbc.connect(conn_str)
 
-    _dept_cache: Dict[str, Tuple[str, str]] = {}
-
-    def get_department(upc: str) -> Tuple[str, str]:
-        upc = (upc or "").strip()
-        if not upc:
-            return ("UNKNOWN", "UNKNOWN")
-        if upc in _dept_cache:
-            return _dept_cache[upc]
-
-        query = f"""
-            SELECT DISTINCT
-                (SELECT SDP.F03 FROM [{DB_NAME}].[dbo].[SDP_TAB] SDP WHERE SDP.F04 = PST.F04) AS DeptNumber,
-                (SELECT DPT.F238 FROM [{DB_NAME}].[dbo].[DEPT_TAB] DPT
-                 WHERE DPT.F03 = (SELECT SDP.F03 FROM [{DB_NAME}].[dbo].[SDP_TAB] SDP WHERE SDP.F04 = PST.F04)) AS DeptName
-            FROM [{DB_NAME}].[dbo].[POS_TAB] PST
-            JOIN [{DB_NAME}].[dbo].[OBJ_TAB] OBJ ON PST.F01 = OBJ.F01
-            WHERE PST.F01 = ?
-        """
-        conn = _get_conn()
-        cur = None
+    def get_vendor_name(conn, f27: str) -> str:
         try:
             cur = conn.cursor()
-            cur.execute(query, (upc,))
+            cur.execute("SELECT F334 FROM dbo.VENDOR_TAB WHERE F27 = ?", str(f27))
             row = cur.fetchone()
-            if row and len(row) >= 2 and row[0] is not None:
-                res = (str(row[0]), str(row[1]) if row[1] is not None else "")
-            else:
-                res = ("UNKNOWN", "UNKNOWN")
-        finally:
-            try:
-                if cur:
-                    cur.close()
-            except Exception:
-                pass
-            conn.close()
+            cur.close()
+            return (str(row[0]).strip() if row and row[0] is not None else "")
+        except Exception:
+            return ""
 
-        _dept_cache[upc] = res
-        return res
-
-    def fetch_order_candidates(f27_value: str) -> List[Tuple[str, str]]:
+    def fetch_order_candidates(conn, f27_value: str) -> List[Tuple[str, str]]:
+        """
+        Candidates are CLOSED orders still in ORDER status, with GUID in F1254.
+        Filters:
+          - F1068='ORDER' and F1067='CLOSE'
+          - F1254 not null/empty
+          - skip if F2630='RTC' (already queued)
+          - skip if F1254 contains 'SENT'
+          - else must be uuid-like
+        """
         sql = f"""
-            SELECT F1032, F1254
+            SELECT F1032, F1254, ISNULL(F2630,'') AS F2630
             FROM [{DB_NAME}].[dbo].[REC_HDR]
             WHERE F27 = ?
               AND F1068 = 'ORDER'
               AND F1067 = 'CLOSE'
               AND F1254 IS NOT NULL
+              AND LTRIM(RTRIM(CAST(F1254 AS varchar(200)))) <> ''
+              AND ISNULL(F2630,'') <> 'RTC'
         """
-        conn = _get_conn()
-        cur = None
+        cur = conn.cursor()
+        cur.execute(sql, (str(f27_value),))
         out: List[Tuple[str, str]] = []
-        try:
-            cur = conn.cursor()
-            cur.execute(sql, (str(f27_value),))
-            for po, guid in cur.fetchall():
-                po_s = str(po).strip() if po else ""
-                guid_s = str(guid).strip() if guid else ""
-                if po_s and guid_s:
-                    out.append((po_s, guid_s))
-        finally:
-            try:
-                if cur:
-                    cur.close()
-            except Exception:
-                pass
-            conn.close()
+
+        for po, f1254, f2630 in cur.fetchall():
+            po_s = _clip(po, 20)
+            f1254_s = ("" if f1254 is None else str(f1254)).strip()
+            f2630_s = ("" if f2630 is None else str(f2630)).strip()
+
+            if not po_s or not f1254_s:
+                continue
+
+            if f2630_s.upper() == "RTC":
+                continue
+
+            if "SENT" in f1254_s.upper():
+                continue
+
+            if not _is_uuid_like(f1254_s):
+                continue
+
+            out.append((po_s, f1254_s))
+
+        cur.close()
         return out
 
-    def mark_order_received(po_number: str) -> None:
-        sql = f"UPDATE [{DB_NAME}].[dbo].[REC_HDR] SET F1068 = 'RECV' WHERE F1032 = ?"
-        conn = _get_conn()
-        cur = None
-        try:
-            cur = conn.cursor()
-            cur.execute(sql, (po_number,))
-            conn.commit()
-        finally:
-            try:
-                if cur:
-                    cur.close()
-            except Exception:
-                pass
-            conn.close()
+    def update_rec_reg_from_unfi(conn, po_number: str, details: List[Dict[str, Any]]) -> Tuple[int, int]:
+        """
+        For each UNFI detail line:
+          - match REC_REG by F1032 (PO) and F01 (GTIN)
+          - only active item rows: F1067='ITEM' and ISNULL(F1069,0)=0
+          - update:
+              F64 = qty
+              F38 = unit cost
+              F65 = unit cost * qty
+        Returns (updated_rows, missing_rows)
+        """
+        updated = 0
+        missing = 0
+        cur = conn.cursor()
+
+        sel = f"""
+            SELECT 1
+            FROM [{DB_NAME}].[dbo].[REC_REG]
+            WHERE F1032 = ?
+              AND F01 = ?
+              AND F1067 = 'ITEM'
+              AND ISNULL(F1069,0) = 0
+        """
+        upd = f"""
+            UPDATE [{DB_NAME}].[dbo].[REC_REG]
+            SET
+                F64 = ?,
+                F65 = ?,
+                F38 = ?
+            WHERE F1032 = ?
+              AND F01 = ?
+              AND F1067 = 'ITEM'
+              AND ISNULL(F1069,0) = 0
+        """
+
+        for it in details:
+            gtin = (str(it.get("gtin", "") or "")).strip()
+            if not gtin:
+                continue
+
+            qty = _safe_int(it.get("quantity", 0), 0)
+            unit_cost = _safe_float(it.get("cost", 0), 0.0)
+            line_total = unit_cost * qty
+
+            cur.execute(sel, (po_number, gtin))
+            if cur.fetchone() is None:
+                missing += 1
+                continue
+
+            cur.execute(upd, (qty, line_total, unit_cost, po_number, gtin))
+            if cur.rowcount:
+                updated += int(cur.rowcount)
+
+        conn.commit()
+        cur.close()
+        return updated, missing
+
+    def set_hdr_ready_to_close(conn, po_number: str) -> None:
+        """
+        Queue for SMS close:
+          - F1068='RECV'
+          - F2630='RTC'
+        Guard:
+          - only if currently ORDER (prevents double-processing)
+        """
+        cur = conn.cursor()
+        sql = f"""
+            UPDATE [{DB_NAME}].[dbo].[REC_HDR]
+            SET
+                F1068 = 'RECV',
+                F2630 = 'RTC'
+            WHERE F1032 = ?
+              AND F1068 = 'ORDER'
+        """
+        cur.execute(sql, (po_number,))
+        conn.commit()
+        cur.close()
 
     # --- Auth / HTTP ---
     def fetch_unfi_id_token(session: requests.Session) -> str:
@@ -315,7 +480,7 @@ def worker(args, ui_q: "queue.Queue") -> None:
                 timeout=UNFI_TIMEOUT_AUTH,
             )
 
-        resp = request_with_retry(do, tries=3, base_sleep=1, ui_q=ui_q, what="UNFI Auth")
+        resp = request_with_retry(do, tries=3, base_sleep=1, what="UNFI Auth")
         if resp.status_code != 200:
             raise RuntimeError(f"UNFI auth failed: {resp.status_code} {resp.text[:400]}")
         return resp.json()["AuthenticationResult"]["IdToken"]
@@ -331,7 +496,7 @@ def worker(args, ui_q: "queue.Queue") -> None:
                 timeout=60,
             )
 
-        resp = request_with_retry(do, tries=3, base_sleep=1, ui_q=ui_q, what="Invafresh Login")
+        resp = request_with_retry(do, tries=3, base_sleep=1, what="Invafresh Login")
         if resp.status_code != 200:
             raise RuntimeError(f"Invafresh login failed: {resp.status_code} {resp.text[:400]}")
         tok = resp.json().get("access_token")
@@ -339,46 +504,70 @@ def worker(args, ui_q: "queue.Queue") -> None:
             raise RuntimeError("Invafresh login did not return access_token.")
         return tok
 
-    # GET https://posapi.../stores/{OrdersStoreId}/orders/{guid}
-    def build_unfi_get_order_url(order_guid: str) -> str:
+    def build_unfi_get_order_url(store_id: str, order_guid: str) -> str:
         guid = (order_guid or "").strip()
         if not guid:
             raise ValueError("order_guid is empty")
-     
         if not _is_uuid_like(guid):
             raise ValueError(f"F1254 value is not a GUID: {guid!r}")
-        return f"{UNFI_API_BASE}/stores/{UNFI_ORDERS_STORE_ID}/orders/{guid}"
+        return f"{UNFI_API_BASE}/stores/{store_id}/orders/{guid}"
 
-    def fetch_unfi_order(session: requests.Session, token: str, order_guid: str) -> Dict[str, Any]:
-        url = build_unfi_get_order_url(order_guid)
+    def fetch_unfi_order(session: requests.Session, token: str, store_id: str, order_guid: str) -> Dict[str, Any]:
+        url = build_unfi_get_order_url(store_id, order_guid)
         headers = {"Authorization": f"Bearer {token}"}
 
         def do():
             return session.get(url, headers=headers, timeout=60)
 
         log_info(f"UNFI GET url={url}")
-        resp = request_with_retry(do, tries=3, base_sleep=1, ui_q=ui_q, what="UNFI GET Order")
-
+        resp = request_with_retry(do, tries=3, base_sleep=1, what="UNFI GET Order")
         if resp.status_code != 200:
             raise RuntimeError(f"UNFI GET failed ({resp.status_code}): {resp.text[:500]}")
-
         return resp.json()
 
-    def unfi_order_to_receipt_transactions(api_data: Dict[str, Any], po_override: str) -> Dict[str, Any]:
+    def unfi_order_to_receipt_transactions(
+        api_data: Dict[str, Any], *, po_override: str, store_number: int, conn: pyodbc.Connection
+    ) -> Dict[str, Any]:
         details = api_data.get("details", []) or []
 
         invoice_number = po_override
         order_number = str(invoice_number)[:5] if invoice_number else ""
         date_str = datetime.now().strftime("%Y%m%d")
 
-        tx = []
-        for item in details:
-            sku = str(item.get("gtin", "")).strip()
-            cost = float(item.get("cost", 0) or 0)
-            qty = int(item.get("quantity", 0) or 0)
-            uom = (str(item.get("uom", "")).strip().lower() or "cs")
+        _dept_cache: Dict[str, str] = {}
 
-            dept_num, _ = get_department(sku)
+        def get_dept_num(gtin: str) -> str:
+            gtin = (gtin or "").strip()
+            if not gtin:
+                return "UNKNOWN"
+            if gtin in _dept_cache:
+                return _dept_cache[gtin]
+
+            query = f"""
+                SELECT DISTINCT
+                    (SELECT SDP.F03 FROM [{DB_NAME}].[dbo].[SDP_TAB] SDP WHERE SDP.F04 = PST.F04) AS DeptNumber
+                FROM [{DB_NAME}].[dbo].[POS_TAB] PST
+                JOIN [{DB_NAME}].[dbo].[OBJ_TAB] OBJ ON PST.F01 = OBJ.F01
+                WHERE PST.F01 = ?
+            """
+            cur = conn.cursor()
+            cur.execute(query, (gtin,))
+            row = cur.fetchone()
+            cur.close()
+            dept = str(row[0]).strip() if row and row[0] is not None else "UNKNOWN"
+            _dept_cache[gtin] = dept
+            return dept
+
+        tx: List[Dict[str, Any]] = []
+        for item in details:
+            sku = str(item.get("gtin", "") or "").strip()
+            if not sku:
+                continue
+
+            unit_cost = _safe_float(item.get("cost", 0), 0.0)
+            qty = _safe_int(item.get("quantity", 0), 0)
+            uom = (str(item.get("uom", "")).strip().lower() or "cs")
+            dept_num = get_dept_num(sku)
 
             tx.append(
                 {
@@ -386,12 +575,12 @@ def worker(args, ui_q: "queue.Queue") -> None:
                     "order_number": int(order_number) if order_number.isdigit() else None,
                     "external_order_number": invoice_number,
                     "delivery_or_invoice_date": date_str,
-                    "store_number": int(STORE_NUMBER),
+                    "store_number": int(store_number),
                     "department_number": dept_num,
                     "sku": sku,
                     "quantity": qty,
                     "quantity_unit_of_measure": uom,
-                    "amount": to_cents(f"{cost:.2f}"),
+                    "amount": to_cents(f"{unit_cost:.2f}"),
                 }
             )
 
@@ -403,82 +592,137 @@ def worker(args, ui_q: "queue.Queue") -> None:
         def do():
             return session.post(INV_RECEIPTS_URL, headers=headers, data=json.dumps(payload), timeout=90)
 
-        return request_with_retry(do, tries=3, base_sleep=1, ui_q=ui_q, what="Invafresh POST receipts")
+        return request_with_retry(do, tries=3, base_sleep=1, what="Invafresh POST receipts")
 
-    # ---- Start job (UI summary) ----
-    ui_summary(ui_q, "INFO", "Get SPS Invoices", f"Starting... (Vendor={args.f27})")
-
+    # -------------------------------------------------------------------------
+    # Work
+    # -------------------------------------------------------------------------
     unfi_sess = requests.Session()
     inv_sess = requests.Session()
 
+    ok = 0
+    failed = 0
+    total_candidates = 0
+
+    conn = _get_conn()
     try:
-        ui_summary(ui_q, "INFO", "UNFI", "Connecting...")
+        log_info("UNFI: Connecting...")
         unfi_token = fetch_unfi_id_token(unfi_sess)
         log_info(f"UNFI token acquired (masked)={mask_token(unfi_token)}")
-        ui_summary(ui_q, "INFO", "UNFI", "Connected")
 
-        ui_summary(ui_q, "INFO", "Invafresh", "Connecting...")
+        log_info("Invafresh: Connecting...")
         inv_token = invafresh_login(inv_sess)
         log_info(f"Invafresh token acquired (masked)={mask_token(inv_token)}")
-        ui_summary(ui_q, "INFO", "Invafresh", "Connected")
 
-        orders = fetch_order_candidates(args.f27)
-        log_info(f"Orders candidates from REC_HDR: {len(orders)} (F27={args.f27})")
+        for f27, vinfo in vendors_to_process.items():
+            store_id = vinfo["store_id"]
+            supplier_name = vinfo["supplier_name"]
 
-        if not orders:
-            ui_summary(ui_q, "DONE", "Done", "No orders found to process.")
-            return
+            vendor_name_db = get_vendor_name(conn, f27) or supplier_name
+            log_info(f"Vendor {f27} ({vendor_name_db}) -> UNFI store_id={store_id}")
 
-        ui_summary(ui_q, "INFO", "Orders", f"Found {len(orders)} order(s) to process")
+            orders = fetch_order_candidates(conn, f27)
+            total_candidates += len(orders)
+            log_info(f"Candidates: {len(orders)} order(s) for vendor={f27}")
 
-        ok = 0
-        failed = 0
+            if not orders:
+                continue
 
-        for po, guid in orders:
-            try:
-                ui_summary(ui_q, "INFO", "Processing", f"PO {po}")
+            for po, guid in orders:
+                try:
+                    log_info(f"Processing PO={po} vendor={f27} guid={guid}")
 
-                api_data = fetch_unfi_order(unfi_sess, unfi_token, guid)
-                ui_summary(ui_q, "INFO", "UNFI", f"PO {po}: Order found")
+                    try:
+                        upsert_po_status(
+                            conn,
+                            f91=po,
+                            f27=f27,
+                            step="GetSPSInvoices",
+                            vendor_name=vendor_name_db,
+                            status_txt="SUCCESS",
+                            message="Processing started",
+                            dept=None,
+                            f1032=_safe_int(po, 0),
+                        )
+                    except Exception:
+                        pass
 
-                payload = unfi_order_to_receipt_transactions(api_data, po_override=po)
-                line_count = len(payload.get("receipt_transactions", []))
-                log_info(f"PO {po}: receipt_transactions lines={line_count}")
+                    api_data = fetch_unfi_order(unfi_sess, unfi_token, store_id, guid)
+                    details = api_data.get("details", []) or []
+                    if not details:
+                        raise RuntimeError("UNFI order has no details lines")
 
-                if line_count <= 0:
-                    ui_summary(ui_q, "WARN", "Skipped", f"PO {po}: No lines to post")
-                    continue
+                    # 1) Update REC_REG qty/costs
+                    updated_rows, missing_rows = update_rec_reg_from_unfi(conn, po, details)
+                    log_info(f"PO={po}: REC_REG updated_rows={updated_rows} missing_rows={missing_rows}")
 
-                resp = post_receipts_to_invafresh(inv_sess, inv_token, payload)
+                    # 2) Post receipts to Invafresh
+                    payload = unfi_order_to_receipt_transactions(api_data, po_override=po, store_number=STORE_NUMBER, conn=conn)
+                    line_count = len(payload.get("receipt_transactions", []))
+                    if line_count <= 0:
+                        raise RuntimeError("No receipt_transactions lines to post")
 
-                if resp.status_code == 401:
-                    log_warn("Invafresh returned 401, re-login once then retry")
-                    ui_summary(ui_q, "WARN", "Invafresh", "Session expired, reconnecting...")
-                    inv_token = invafresh_login(inv_sess)
                     resp = post_receipts_to_invafresh(inv_sess, inv_token, payload)
 
-                if not (200 <= resp.status_code < 300):
-                    raise RuntimeError(f"Invafresh POST failed ({resp.status_code}): {resp.text[:600]}")
+                    if resp.status_code == 401:
+                        log_warn("Invafresh returned 401, re-login once then retry")
+                        inv_token = invafresh_login(inv_sess)
+                        resp = post_receipts_to_invafresh(inv_sess, inv_token, payload)
 
-                mark_order_received(po)
+                    if not (200 <= resp.status_code < 300):
+                        raise RuntimeError(f"Invafresh POST failed ({resp.status_code}): {resp.text[:600]}")
 
-                ok += 1
-                ui_summary(ui_q, "SUCCESS", "Success", f"PO {po}: Posted + marked RECV ({line_count} line(s))")
+                    # 3) Queue for SMS close: set RECV + RTC
+                    set_hdr_ready_to_close(conn, po)
 
-            except Exception as e:
-                failed += 1
-                log_error(f"PO {po} failed: {type(e).__name__}: {e}")
-                ui_summary(ui_q, "ERROR", "PO failed", f"PO {po}: {type(e).__name__}")
+                    # 4) Report
+                    try:
+                        upsert_po_status(
+                            conn,
+                            f91=po,
+                            f27=f27,
+                            step="RTC",
+                            vendor_name=vendor_name_db,
+                            status_txt="SUCCESS",
+                            message=f"Posted Invafresh OK | REC_REG updated={updated_rows} missing={missing_rows}",
+                            dept=None,
+                            f1032=_safe_int(po, 0),
+                        )
+                    except Exception:
+                        pass
+
+                    ok += 1
+                    log_info(f"SUCCESS PO={po}: Posted + set F1068=RECV + F2630=RTC ({line_count} line(s))")
+
+                except Exception as e:
+                    failed += 1
+                    log_error(f"FAILED PO={po}: {type(e).__name__}: {e}")
+
+                    try:
+                        upsert_po_status(
+                            conn,
+                            f91=po,
+                            f27=f27,
+                            step="GetSPSInvoices",
+                            vendor_name=vendor_name_db,
+                            status_txt="FAILED",
+                            message=f"{type(e).__name__}: {e}",
+                            dept=None,
+                            f1032=_safe_int(po, 0),
+                        )
+                    except Exception:
+                        pass
 
         dur = round(time.perf_counter() - start, 2)
-        ui_summary(ui_q, "DONE", "Done", f"Processed OK={ok} | Failed={failed} | Total={len(orders)} | {dur}s")
-
-    except Exception as e:
-        log_error(f"Fatal error: {type(e).__name__}: {e}")
-        ui_summary(ui_q, "ERROR", "Fatal error", type(e).__name__)
-        ui_summary(ui_q, "DONE", "Done", "Processed OK=0 | Failed=1 | Total=1")
+        log_info(f"Done. OK={ok} Failed={failed} TotalCandidates={total_candidates} Duration={dur}s")
+        logging.info("=== End run ===")
+        return 0 if failed == 0 else 2
 
     finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
         try:
             unfi_sess.close()
         except Exception:
@@ -490,23 +734,27 @@ def worker(args, ui_q: "queue.Queue") -> None:
 
 
 # =============================================================================
-# Main (UI + thread)
+# Main
 # =============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Get SPS Invoices (UNFI -> Invafresh) with UI")
-    parser.add_argument("--f27", default="3954", help="Vendor number in REC_HDR.F27 (ex: 3954 or 7313)")
-    parser.add_argument("--autoclose", default="20", help="Auto-close seconds after done/error (default 20)")
+    parser = argparse.ArgumentParser(description="Get SPS Invoices (UNFI -> Invafresh) - Scheduled task mode (no UI)")
+    parser.add_argument(
+        "--f27",
+        default="",
+        help="Optional: process only this UNFI vendor (must exist in UNFI vendor sections). If empty, processes all configured UNFI vendors.",
+    )
     args = parser.parse_args()
 
     setup_logging()
+    exit_code = 2
+    try:
+        exit_code = run_job(args)
+    except Exception as e:
+        log_error(f"Fatal error: {type(e).__name__}: {e}")
+        logging.info("=== End run (fatal) ===")
+        exit_code = 2
 
-    ui_q: "queue.Queue" = queue.Queue()
-    ui = VendorSendUI(title="Get SPS Invoices", queue=ui_q, auto_close_seconds=int(args.autoclose))
-
-    t = threading.Thread(target=worker, args=(args, ui_q), daemon=True)
-    t.start()
-
-    ui.run()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -123,4 +123,13 @@ pyinstaller --noconfirm --clean --onefile --windowed `
   src\drivers\get_sps_invoices\main.py
 
 
+ONEDIR
+pyinstaller --noconfirm --clean --onedir --windowed `
+  --name GetSPSInvoices `
+  --paths src `
+  --version-file src\drivers\get_sps_invoices\version_info.txt `
+  src\drivers\get_sps_invoices\main.py
+
+
+
 

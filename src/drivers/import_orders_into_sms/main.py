@@ -790,7 +790,7 @@ def run_import():
         # Purge is optional; keep friendly if table isn't accessible
         purge_ravyx_po_status(conn, REPORT_PURGE_DAYS)
 
-        # ============ ONLY NOW we touch Upshop API ============
+        # ============ Upshop API ============
         status("Connecting to Upshop API...", "Requesting auth token")
         urlt = f"{base_url}/login"
         payloadt = {"username": api_username, "password": api_password}
