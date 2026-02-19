@@ -1,5 +1,6 @@
 import argparse
 import configparser
+import ctypes
 import json
 import logging
 import os
@@ -10,9 +11,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pyodbc
 import requests
+from requests.exceptions import RequestException, Timeout, HTTPError, ConnectionError
+
 
 # =============================================================================
-# No UI (scheduled task friendly)
+# No UI (scheduled task friendly) + Optional DEV console (DebugScreen=1)
 # =============================================================================
 
 # =============================================================================
@@ -26,13 +29,72 @@ def _base_dir() -> str:
     return os.path.dirname(sys.executable) if _is_frozen() else os.path.dirname(os.path.abspath(__file__))
 
 
+def _find_config_path() -> str:
+    """
+    Look for config.ini in:
+      1) Parent folder of the EXE/script folder (shared config)
+      2) Same folder as the EXE/script (local fallback)
+    """
+    base = _base_dir()
+    parent = os.path.dirname(base)
+    candidates = [
+        os.path.join(parent, "config.ini"),
+        os.path.join(base, "config.ini"),
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]  # best “expected” path for error messages
+
+
 BASE_DIR = _base_dir()
-CONFIG_PATH = os.path.join(BASE_DIR, "config.ini")
+CONFIG_PATH = _find_config_path()
+
+# =============================================================================
+# Optional DEV console (only when frozen + DebugScreen=1)
+# =============================================================================
+def ensure_console() -> None:
+    """
+    Open a CMD console even if app is built with --windowed.
+    Safe no-op if a console already exists.
+    """
+    if os.name != "nt":
+        return
+
+    kernel32 = ctypes.windll.kernel32
+
+    # already has a console?
+    if kernel32.GetConsoleWindow():
+        return
+
+    # allocate new console
+    if kernel32.AllocConsole() == 0:
+        return
+
+    # rebind stdio
+    sys.stdout = open("CONOUT$", "w", buffering=1, encoding="utf-8", errors="replace")
+    sys.stderr = open("CONOUT$", "w", buffering=1, encoding="utf-8", errors="replace")
+    sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+
+
+def _read_debugscreen_quick(path: str) -> int:
+    """
+    Read Settings.DebugScreen early so we can open console before logging.
+    If config.ini isn't found yet, returns 0.
+    """
+    try:
+        cfg = configparser.ConfigParser()
+        if not cfg.read(path, encoding="utf-8"):
+            return 0
+        return int(cfg.get("Settings", "DebugScreen", fallback="0") or "0")
+    except Exception:
+        return 0
+
 
 # =============================================================================
 # Logging setup (file + console)
 # =============================================================================
-LOG_DIR = os.path.join(BASE_DIR, "Log")
+LOG_DIR = os.path.join(BASE_DIR, "LOG")
 os.makedirs(LOG_DIR, exist_ok=True)
 
 log_ts = datetime.now().strftime("%Y_%m_%d")
@@ -103,7 +165,7 @@ def request_with_retry(
     for i in range(1, tries + 1):
         try:
             return fn()
-        except Exception as e:
+        except (ConnectionError, Timeout, HTTPError, RequestException) as e:
             last = e
             log_warn(f"{what} failed (try {i}/{tries}): {type(e).__name__}: {e}")
             if i < tries:
@@ -158,7 +220,7 @@ def upsert_po_status(
 ):
     """
     Uses MERGE to update/insert dbo.RAVYX_PO_STATUS.
-    Note: For SUCCESS, we store NULL in F1081 (message) to keep it clean.
+    For SUCCESS, stores NULL in F1081 to keep report clean.
     """
     f91 = _clip(f91, 20)
     f27 = _clip(f27, 14)
@@ -222,7 +284,12 @@ def load_config(path: str) -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
     read_ok = cfg.read(path, encoding="utf-8")
     if not read_ok:
-        raise FileNotFoundError(f"config.ini not loaded. Path={path}")
+        raise FileNotFoundError(
+            "config.ini not loaded.\n"
+            f"Tried:\n"
+            f"  1) {os.path.join(os.path.dirname(BASE_DIR), 'config.ini')}\n"
+            f"  2) {os.path.join(BASE_DIR, 'config.ini')}\n"
+        )
     return cfg
 
 
@@ -286,8 +353,9 @@ def run_job(args) -> int:
     UNFI_AUTH_URL = (cfg.get("UNFI", "AuthUrl", fallback="") or "").strip()
     UNFI_CLIENT_ID = (cfg.get("UNFI", "ClientId", fallback="") or "").strip()
     UNFI_USERNAME = (cfg.get("UNFI", "Username", fallback="") or "").strip()
-    UNFI_PASSWORD = (cfg.get("UNFI", "Password", fallback="") or "").strip().strip('"')
+    UNFI_PASSWORD = (cfg.get("UNFI", "Password", fallback="") or "").strip().strip('"').strip("'")
     UNFI_TIMEOUT_AUTH = _safe_int(cfg.get("UNFI", "TimeoutAuthSec", fallback="90"), 90)
+    UNFI_TIMEOUT_GET = _safe_int(cfg.get("UNFI", "TimeoutGetSec", fallback="60"), 60)
     UNFI_API_BASE = (cfg.get("UNFI", "ApiBaseUrl", fallback="") or "").strip().rstrip("/")
 
     if not (UNFI_AUTH_URL and UNFI_CLIENT_ID and UNFI_USERNAME and UNFI_PASSWORD and UNFI_API_BASE):
@@ -310,17 +378,14 @@ def run_job(args) -> int:
     # UNFI vendors
     unfi_vendors = load_unfi_vendors(cfg)
     if not unfi_vendors:
-        raise RuntimeError(
-            "No UNFI vendor sections found. Add [UNFIGW]/[UNFIRC]/[UNFIVendorX] with SupplierId+StoreID"
-        )
+        raise RuntimeError("No UNFI vendor sections found. Add [UNFIxxx] with SupplierId+StoreID")
 
-    vendors_to_process: Dict[str, Dict[str, str]] = {}
     if args.f27:
         if args.f27 not in unfi_vendors:
             raise RuntimeError(
                 f"Vendor {args.f27} not found in UNFI vendor sections. Add section like [UNFIVendor...] SupplierId={args.f27}"
             )
-        vendors_to_process[args.f27] = unfi_vendors[args.f27]
+        vendors_to_process = {args.f27: unfi_vendors[args.f27]}
     else:
         vendors_to_process = unfi_vendors
 
@@ -337,7 +402,7 @@ def run_job(args) -> int:
     def get_vendor_name(conn, f27: str) -> str:
         try:
             cur = conn.cursor()
-            cur.execute("SELECT F334 FROM dbo.VENDOR_TAB WHERE F27 = ?", str(f27))
+            cur.execute("SELECT TOP 1 F334 FROM dbo.VENDOR_TAB WHERE F27 = ?", str(f27))
             row = cur.fetchone()
             cur.close()
             return (str(row[0]).strip() if row and row[0] is not None else "")
@@ -375,13 +440,10 @@ def run_job(args) -> int:
 
             if not po_s or not f1254_s:
                 continue
-
             if f2630_s.upper() == "RTC":
                 continue
-
             if "SENT" in f1254_s.upper():
                 continue
-
             if not _is_uuid_like(f1254_s):
                 continue
 
@@ -483,7 +545,12 @@ def run_job(args) -> int:
         resp = request_with_retry(do, tries=3, base_sleep=1, what="UNFI Auth")
         if resp.status_code != 200:
             raise RuntimeError(f"UNFI auth failed: {resp.status_code} {resp.text[:400]}")
-        return resp.json()["AuthenticationResult"]["IdToken"]
+
+        data = resp.json()
+        tok = (((data.get("AuthenticationResult") or {}).get("IdToken")) or "").strip()
+        if not tok:
+            raise RuntimeError("UNFI auth response missing AuthenticationResult.IdToken")
+        return tok
 
     def invafresh_login(session: requests.Session) -> str:
         payload = {"username": INV_USER, "password": INV_PASS}
@@ -499,7 +566,9 @@ def run_job(args) -> int:
         resp = request_with_retry(do, tries=3, base_sleep=1, what="Invafresh Login")
         if resp.status_code != 200:
             raise RuntimeError(f"Invafresh login failed: {resp.status_code} {resp.text[:400]}")
-        tok = resp.json().get("access_token")
+
+        data = resp.json()
+        tok = (data.get("access_token") or "").strip()
         if not tok:
             raise RuntimeError("Invafresh login did not return access_token.")
         return tok
@@ -517,7 +586,7 @@ def run_job(args) -> int:
         headers = {"Authorization": f"Bearer {token}"}
 
         def do():
-            return session.get(url, headers=headers, timeout=60)
+            return session.get(url, headers=headers, timeout=UNFI_TIMEOUT_GET)
 
         log_info(f"UNFI GET url={url}")
         resp = request_with_retry(do, tries=3, base_sleep=1, what="UNFI GET Order")
@@ -544,7 +613,7 @@ def run_job(args) -> int:
                 return _dept_cache[gtin]
 
             query = f"""
-                SELECT DISTINCT
+                SELECT TOP 1
                     (SELECT SDP.F03 FROM [{DB_NAME}].[dbo].[SDP_TAB] SDP WHERE SDP.F04 = PST.F04) AS DeptNumber
                 FROM [{DB_NAME}].[dbo].[POS_TAB] PST
                 JOIN [{DB_NAME}].[dbo].[OBJ_TAB] OBJ ON PST.F01 = OBJ.F01
@@ -632,6 +701,7 @@ def run_job(args) -> int:
                 try:
                     log_info(f"Processing PO={po} vendor={f27} guid={guid}")
 
+                    # optional "started" ping
                     try:
                         upsert_po_status(
                             conn,
@@ -657,7 +727,9 @@ def run_job(args) -> int:
                     log_info(f"PO={po}: REC_REG updated_rows={updated_rows} missing_rows={missing_rows}")
 
                     # 2) Post receipts to Invafresh
-                    payload = unfi_order_to_receipt_transactions(api_data, po_override=po, store_number=STORE_NUMBER, conn=conn)
+                    payload = unfi_order_to_receipt_transactions(
+                        api_data, po_override=po, store_number=STORE_NUMBER, conn=conn
+                    )
                     line_count = len(payload.get("receipt_transactions", []))
                     if line_count <= 0:
                         raise RuntimeError("No receipt_transactions lines to post")
@@ -737,6 +809,13 @@ def run_job(args) -> int:
 # Main
 # =============================================================================
 def main():
+    # Open DEV console early (only when frozen + DebugScreen=1)
+    if _is_frozen() and _read_debugscreen_quick(CONFIG_PATH) == 1:
+        ensure_console()
+        print("=== DEBUG CONSOLE ENABLED (DebugScreen=1) ===")
+        print(f"BASE_DIR={BASE_DIR}")
+        print(f"CONFIG_PATH={CONFIG_PATH}")
+
     parser = argparse.ArgumentParser(description="Get SPS Invoices (UNFI -> Invafresh) - Scheduled task mode (no UI)")
     parser.add_argument(
         "--f27",
@@ -746,6 +825,7 @@ def main():
     args = parser.parse_args()
 
     setup_logging()
+
     exit_code = 2
     try:
         exit_code = run_job(args)

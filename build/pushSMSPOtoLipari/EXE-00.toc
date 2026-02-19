@@ -62,7 +62,7 @@
  [],
  False,
  False,
- 1771009575,
+ 1771510460,
  [('runw.exe',
    'C:\\XchUpshop\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe',
    'EXECUTABLE')],
