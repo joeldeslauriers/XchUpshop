@@ -130,6 +130,18 @@ pyinstaller --noconfirm --clean --onedir --windowed `
   --version-file src\drivers\get_sps_invoices\version_info.txt `
   src\drivers\get_sps_invoices\main.py
 
+========================================
+GetLIPARIInvoices
+========================================
+
+  ONEDIR
+  pyinstaller --noconfirm --clean --onedir --windowed `
+  --name GetLipariInvoices `
+  --paths src `
+  --version-file src\drivers\get_lipari_invoice\version_info.txt `
+  src\drivers\get_lipari_invoice\main.py
+
+
 
 
 

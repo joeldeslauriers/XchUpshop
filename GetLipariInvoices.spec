@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['src\\drivers\\get_lipari_invoice\\getLipariInvoices.py'],
+    ['src\\drivers\\get_lipari_invoice\\main.py'],
     pathex=['src'],
     binaries=[],
     datas=[],
@@ -19,20 +19,27 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='GetLipariInvoices',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
-    console=True,
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version='src\\drivers\\get_lipari_invoice\\version_info.txt',
+)
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='GetLipariInvoices',
 )

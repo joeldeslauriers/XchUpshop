@@ -186,10 +186,14 @@ def _clip(s: Any, n: int) -> str:
 
 
 def _safe_int(v: Any, default: int = 0) -> int:
+    """
+    Safe int conversion that tolerates strings like "12.0000" or "12,0000".
+    """
     try:
         if v is None or v == "":
             return default
-        return int(v)
+        s = str(v).strip().replace(",", ".")
+        return int(round(float(s)))
     except Exception:
         return default
 
@@ -198,7 +202,8 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
     try:
         if v is None or v == "":
             return default
-        return float(v)
+        s = str(v).strip().replace(",", ".")
+        return float(s)
     except Exception:
         return default
 
@@ -452,35 +457,52 @@ def run_job(args) -> int:
         cur.close()
         return out
 
+    # ---------------------------
+    # FIXED: Update REC_REG using CS/EA logic like Lipari
+    # ---------------------------
     def update_rec_reg_from_unfi(conn, po_number: str, details: List[Dict[str, Any]]) -> Tuple[int, int]:
         """
-        For each UNFI detail line:
-          - match REC_REG by F1032 (PO) and F01 (GTIN)
-          - only active item rows: F1067='ITEM' and ISNULL(F1069,0)=0
-          - update:
-              F64 = qty
-              F38 = unit cost
-              F65 = unit cost * qty
-        Returns (updated_rows, missing_rows)
+        Updates REC_REG based on UNFI line UOM, matching Lipari behavior:
+
+        If UOM is CS/CASE:
+          - qty = cases
+          - cost = cost per case
+          - F75 = cases
+          - F64 = cases * F19
+          - F38 = cost per case
+          - F1140 = cost per unit = F38 / F19
+          - F65 = total = cases * F38
+
+        If UOM is EA/EACH (or unknown -> EA):
+          - qty = units
+          - cost = unit cost
+          - F64 = units
+          - F75 = units / F19 (decimal)
+          - F1140 = unit cost
+          - F38 = cost per case = unit_cost * F19
+          - F65 = total = units * unit_cost
         """
         updated = 0
         missing = 0
         cur = conn.cursor()
 
-        sel = f"""
-            SELECT 1
+        sel_pack = f"""
+            SELECT TOP 1 F19
             FROM [{DB_NAME}].[dbo].[REC_REG]
             WHERE F1032 = ?
               AND F01 = ?
               AND F1067 = 'ITEM'
               AND ISNULL(F1069,0) = 0
         """
+
         upd = f"""
             UPDATE [{DB_NAME}].[dbo].[REC_REG]
             SET
-                F64 = ?,
-                F65 = ?,
-                F38 = ?
+                F75   = ?,   -- cases
+                F64   = ?,   -- units
+                F38   = ?,   -- cost per case
+                F1140 = ?,   -- cost per unit
+                F65   = ?    -- total cost
             WHERE F1032 = ?
               AND F01 = ?
               AND F1067 = 'ITEM'
@@ -493,15 +515,52 @@ def run_job(args) -> int:
                 continue
 
             qty = _safe_int(it.get("quantity", 0), 0)
-            unit_cost = _safe_float(it.get("cost", 0), 0.0)
-            line_total = unit_cost * qty
+            cost = _safe_float(it.get("cost", 0), 0.0)
+            uom = (str(it.get("uom", "") or "")).strip().lower()
 
-            cur.execute(sel, (po_number, gtin))
-            if cur.fetchone() is None:
+            cur.execute(sel_pack, (po_number, gtin))
+            row = cur.fetchone()
+            if row is None:
                 missing += 1
                 continue
 
-            cur.execute(upd, (qty, line_total, unit_cost, po_number, gtin))
+            pack = _safe_int(row[0], 0)
+            if pack <= 0:
+                pack = 1
+
+            is_case = uom in ("cs", "case", "cases", "ctn", "carton")
+            is_each = uom in ("ea", "each", "unit", "units")
+
+            if is_case:
+                cases = int(qty)
+                units = int(cases * pack)
+
+                case_cost = float(cost)
+                unit_cost = case_cost / float(pack) if pack > 0 else case_cost
+                total_cost = case_cost * float(cases)
+
+                f75 = float(cases)
+                f64 = float(units)
+                f38 = float(case_cost)
+                f1140 = float(unit_cost)
+                f65 = float(total_cost)
+
+            else:
+                # default to EA if not clearly CS
+                units = int(qty)
+                unit_cost = float(cost)
+                total_cost = unit_cost * float(units)
+
+                cases = float(units) / float(pack) if pack > 0 else float(units)
+                case_cost = unit_cost * float(pack)
+
+                f75 = float(cases)
+                f64 = float(units)
+                f38 = float(case_cost)
+                f1140 = float(unit_cost)
+                f65 = float(total_cost)
+
+            cur.execute(upd, (f75, f64, f38, f1140, f65, po_number, gtin))
             if cur.rowcount:
                 updated += int(cur.rowcount)
 
@@ -633,9 +692,9 @@ def run_job(args) -> int:
             if not sku:
                 continue
 
-            unit_cost = _safe_float(item.get("cost", 0), 0.0)
+            cost = _safe_float(item.get("cost", 0), 0.0)
             qty = _safe_int(item.get("quantity", 0), 0)
-            uom = (str(item.get("uom", "")).strip().lower() or "cs")
+            uom = (str(item.get("uom", "") or "").strip().lower() or "cs")
             dept_num = get_dept_num(sku)
 
             tx.append(
@@ -649,7 +708,7 @@ def run_job(args) -> int:
                     "sku": sku,
                     "quantity": qty,
                     "quantity_unit_of_measure": uom,
-                    "amount": to_cents(f"{unit_cost:.2f}"),
+                    "amount": to_cents(f"{cost:.2f}"),
                 }
             )
 
@@ -722,7 +781,7 @@ def run_job(args) -> int:
                     if not details:
                         raise RuntimeError("UNFI order has no details lines")
 
-                    # 1) Update REC_REG qty/costs
+                    # 1) Update REC_REG qty/costs (fixed)
                     updated_rows, missing_rows = update_rec_reg_from_unfi(conn, po, details)
                     log_info(f"PO={po}: REC_REG updated_rows={updated_rows} missing_rows={missing_rows}")
 
