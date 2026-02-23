@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import time
+from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -136,6 +137,10 @@ def request_with_retry(fn, *, tries: int = 3, base_sleep: float = 1.0, what: str
                 raise last
 
 
+def _clip(s: Any, n: int) -> str:
+    return ("" if s is None else str(s)).strip()[:n]
+
+
 # =============================================================================
 # Config parsing
 # =============================================================================
@@ -197,7 +202,93 @@ def pick_invafresh_section(cfg: configparser.ConfigParser) -> str:
             pwd = (cfg.get(section, "Password", fallback="") or "").strip()
             if base and user and pwd:
                 return section
-    raise RuntimeError("config.ini missing Invafresh login section: need [GetLipariInvoice] or [GetSpsInvoice] or [ImportOrders] with BaseUrl/Username/Password")
+    raise RuntimeError(
+        "config.ini missing Invafresh login section: need [GetLipariInvoice] or [GetSpsInvoice] or [ImportOrders] "
+        "with BaseUrl/Username/Password"
+    )
+
+
+# =============================================================================
+# RAVYX_PO_STATUS helpers
+# =============================================================================
+def get_vendor_name(cur, f27: str) -> str:
+    try:
+        cur.execute("SELECT TOP 1 F334 FROM dbo.VENDOR_TAB WHERE F27 = ?", (str(f27).strip(),))
+        row = cur.fetchone()
+        return (str(row[0]).strip() if row and row[0] is not None else "")
+    except Exception:
+        return ""
+
+
+def upsert_ravyx_po_status(
+    conn: pyodbc.Connection,
+    *,
+    f1032: str,
+    f91: str,
+    f02: str,
+    f27: str,
+    f334: str,
+    f29: str,
+    f1081: Optional[str],
+    f03: Optional[int],
+):
+    """
+    We MERGE on (F1032, F27, F02) so each PO can have multiple steps (Order Export, Invoicing, RTC, etc.)
+    SUCCESS => store NULL in F1081 (clean report).
+    """
+    f1032_s = _clip(f1032, 20)
+    f91_s = _clip(f91, 20)
+    f02_s = _clip(f02, 60)
+    f27_s = _clip(f27, 14)
+    f334_s = _clip(f334, 60)
+    f29_s = _clip(f29, 60)
+
+    msg_db = None if f29_s.upper() == "SUCCESS" else _clip(f1081, 5000)
+    dept_i = None if f03 is None else int(f03)
+
+    sql = """
+    MERGE dbo.RAVYX_PO_STATUS AS T
+    USING (SELECT ? AS F1032, ? AS F27, ? AS F02) AS S
+      ON (T.F1032 = S.F1032 AND T.F27 = S.F27 AND T.F02 = S.F02)
+    WHEN MATCHED THEN
+      UPDATE SET
+        T.F91   = ?,
+        T.F334  = ?,
+        T.F254  = ?,
+        T.F29   = ?,
+        T.F1081 = ?,
+        T.F03   = COALESCE(?, T.F03)
+    WHEN NOT MATCHED THEN
+      INSERT (F1032, F91, F02, F27, F334, F254, F29, F1081, F03)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """
+
+    now = datetime.now()
+    params = (
+        f1032_s,
+        f27_s,
+        f02_s,
+        f91_s,
+        f334_s,
+        now,
+        f29_s,
+        msg_db,
+        dept_i,
+        f1032_s,
+        f91_s,
+        f02_s,
+        f27_s,
+        f334_s,
+        now,
+        f29_s,
+        msg_db,
+        dept_i,
+    )
+
+    c = conn.cursor()
+    c.execute(sql, params)
+    conn.commit()
+    c.close()
 
 
 # =============================================================================
@@ -230,7 +321,9 @@ def get_department_number(cur, sku: str) -> int:
         return 0
 
 
-def get_rec_reg_before(cur, po_number: str, sku: str) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+def get_rec_reg_before(
+    cur, po_number: str, sku: str
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
     """
     Returns (F19 pack, F75 cases, F64 units, F38 cost_per_case, F1140 cost_each) before update.
     """
@@ -259,7 +352,9 @@ def get_rec_reg_before(cur, po_number: str, sku: str) -> Tuple[Optional[float], 
         return None, None, None, None, None
 
 
-def update_rec_reg_line_cs(cur, po_number: str, sku: str, qty_cases: int, case_cost: float) -> Tuple[bool, int, int, float, float]:
+def update_rec_reg_line_cs(
+    cur, po_number: str, sku: str, qty_cases: int, case_cost: float
+) -> Tuple[bool, int, int, float, float]:
     """
     CSV is CS:
       - F19 = units per case (already in REC_REG)
@@ -380,7 +475,9 @@ def main() -> int:
     log_info(f"Lipari: InputDir={input_dir}")
     log_info(f"Lipari: ArchiveDir={archive_dir}")
     log_info(f"Lipari: VendorF27={vendor_f27} DefaultUOM={default_uom}")
-    log_info(f"Lipari: StoreRanges={len(store_ranges)} FailUnknownStore={int(fail_unknown_store)} FailMissingSku={int(fail_missing_sku)}")
+    log_info(
+        f"Lipari: StoreRanges={len(store_ranges)} FailUnknownStore={int(fail_unknown_store)} FailMissingSku={int(fail_missing_sku)}"
+    )
 
     sess = requests.Session()
 
@@ -402,6 +499,10 @@ def main() -> int:
     conn = pyodbc.connect(conn_str)
     cur = conn.cursor()
     log_info("SQL: connection OK")
+
+    # vendor name once
+    vendor_name = get_vendor_name(cur, vendor_f27) or "Lipari"
+    log_info(f"VendorName(F334) resolved: {vendor_name}")
 
     processed_files = 0
     posted_files = 0
@@ -444,6 +545,7 @@ def main() -> int:
             fail_reason = ""
 
             pos_to_set_rtc: Set[str] = set()
+            dept_seen: List[int] = []
 
             try:
                 with open(input_csv_path, newline="", encoding="utf-8-sig") as csvfile:
@@ -472,18 +574,25 @@ def main() -> int:
 
                         if vendor_f27 and not sku_belongs_to_vendor(cur, sku, vendor_f27):
                             skipped_vendor_mismatch += 1
-                            log_warn(f"Vendor mismatch: SKU={sku} not linked to vendor F27={vendor_f27} | LipariItem={lipari_item} | file={filename} | line={line_total}")
+                            log_warn(
+                                f"Vendor mismatch: SKU={sku} not linked to vendor F27={vendor_f27} | "
+                                f"LipariItem={lipari_item} | file={filename} | line={line_total}"
+                            )
                             continue
 
                         dept = get_department_number(cur, sku)
                         if dept == 0:
                             dept0_count += 1
+                        else:
+                            dept_seen.append(int(dept))
 
                         location_id = _safe_int(row.get("StoreNumber"), 0)
                         store_number = map_location_to_store(location_id, store_ranges) if location_id else 0
                         if store_number <= 0:
                             unknown_store += 1
-                            msg = f"Unknown store mapping for StoreNumber={location_id} | file={filename} | line={line_total}"
+                            msg = (
+                                f"Unknown store mapping for StoreNumber={location_id} | file={filename} | line={line_total}"
+                            )
                             log_warn(msg)
                             if fail_unknown_store:
                                 must_fail_file = True
@@ -498,7 +607,9 @@ def main() -> int:
 
                         before_f19, before_f75, before_f64, before_f38, before_f1140 = get_rec_reg_before(cur, po_num, sku)
 
-                        updated, pack, new_units, new_unit_cost, new_total_cost = update_rec_reg_line_cs(cur, po_num, sku, qty_cases, case_cost)
+                        updated, pack, new_units, new_unit_cost, new_total_cost = update_rec_reg_line_cs(
+                            cur, po_num, sku, qty_cases, case_cost
+                        )
 
                         if updated:
                             rec_updated += 1
@@ -565,6 +676,24 @@ def main() -> int:
                     conn.rollback()
                 except Exception:
                     pass
+                # Write FAILED row to RAVYX_PO_STATUS if we can infer a PO from the file (best effort)
+                try:
+                    # try to infer a PO from filename patterns like "...326210..."
+                    inferred_po = "".join([c for c in os.path.splitext(filename)[0] if c.isdigit()])[:20]
+                    if inferred_po:
+                        upsert_ravyx_po_status(
+                            conn,
+                            f1032=inferred_po,
+                            f91=inferred_po,
+                            f02="Invoicing",
+                            f27=vendor_f27,
+                            f334=vendor_name,
+                            f29="FAILED",
+                            f1081=fail_reason,
+                            f03=None,
+                        )
+                except Exception:
+                    pass
                 continue
 
             for po in sorted(pos_to_set_rtc):
@@ -607,6 +736,14 @@ def main() -> int:
             except Exception as e:
                 log_warn(f"Could not write JSON for file={filename}: {type(e).__name__}: {e}")
 
+            # choose a dept to store in RAVYX_PO_STATUS (mode of depts in file)
+            dept_for_status: Optional[int] = None
+            if dept_seen:
+                dept_for_status = int(Counter(dept_seen).most_common(1)[0][0])
+
+            # PO for status: if multiple POs exist in one file, we will log one row per PO after POST OK
+            pos_in_file = sorted(pos_to_set_rtc) if pos_to_set_rtc else []
+
             try:
                 log_info(f"POST Invafresh: file={filename} tx={len(transactions)}")
 
@@ -632,6 +769,30 @@ def main() -> int:
                 posted_files += 1
                 log_info(f"POST successful file={filename} status={rpost.status_code} body={rpost.text[:300]}")
 
+                # SUCCESS -> write RAVYX_PO_STATUS (F02='Invoicing', F29='SUCCESS', F1081=NULL)
+                # Best effort: one row per PO found in this file
+                try:
+                    if not pos_in_file:
+                        # fallback: attempt to infer PO from first transaction invoice_number
+                        if transactions and (transactions[0].get("invoice_number") or ""):
+                            pos_in_file = [str(transactions[0]["invoice_number"]).strip()]
+
+                    for po in pos_in_file:
+                        upsert_ravyx_po_status(
+                            conn,
+                            f1032=po,
+                            f91=po,
+                            f02="Invoicing",
+                            f27=vendor_f27,
+                            f334=vendor_name,
+                            f29="SUCCESS",
+                            f1081=None,
+                            f03=dept_for_status,
+                        )
+                except Exception as e:
+                    log_warn(f"RAVYX_PO_STATUS upsert (SUCCESS) failed: {type(e).__name__}: {e}")
+
+                # Move CSV to archive only after successful POST
                 try:
                     shutil.move(input_csv_path, archived_csv_path)
                     log_info(f"Moved file to archive: {archived_csv_path}")
@@ -642,7 +803,32 @@ def main() -> int:
                 failed_files += 1
                 log_error(f"POST failed file={filename}: {type(e).__name__}: {e}")
 
-        log_info(f"Done. processed_files={processed_files} posted_files={posted_files} failed_files={failed_files} skipped_files={skipped_files}")
+                # FAILED -> write RAVYX_PO_STATUS (F02='Invoicing', F29='FAILED', F1081=error)
+                try:
+                    if not pos_in_file:
+                        if transactions and (transactions[0].get("invoice_number") or ""):
+                            pos_in_file = [str(transactions[0]["invoice_number"]).strip()]
+
+                    for po in pos_in_file or [""]:
+                        if po:
+                            upsert_ravyx_po_status(
+                                conn,
+                                f1032=po,
+                                f91=po,
+                                f02="Invoicing",
+                                f27=vendor_f27,
+                                f334=vendor_name,
+                                f29="FAILED",
+                                f1081=f"{type(e).__name__}: {e}",
+                                f03=dept_for_status,
+                            )
+                except Exception as ex:
+                    log_warn(f"RAVYX_PO_STATUS upsert (FAILED) failed: {type(ex).__name__}: {ex}")
+
+        log_info(
+            f"Done. processed_files={processed_files} posted_files={posted_files} "
+            f"failed_files={failed_files} skipped_files={skipped_files}"
+        )
         log_info("=== End run ===")
         return 0 if failed_files == 0 else 2
 
@@ -662,10 +848,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    setup_logging()
     try:
         sys.exit(main())
     except Exception as e:
-        log_error(f"Fatal error: {type(e).__name__}: {e}")
-        log_info("=== End run (fatal) ===")
+        try:
+            setup_logging()
+            log_error(f"Fatal error: {type(e).__name__}: {e}")
+            log_info("=== End run (fatal) ===")
+        except Exception:
+            pass
         sys.exit(2)

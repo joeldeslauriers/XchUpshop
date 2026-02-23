@@ -209,73 +209,73 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
 
 
 # =============================================================================
-# RAVYX_PO_STATUS (minimal writer - keeps your report populated)
+# RAVYX_PO_STATUS (Invoicing) - MERGE on (F1032,F27,F02)
 # =============================================================================
-def upsert_po_status(
-    conn,
+def upsert_ravyx_po_status(
+    conn: pyodbc.Connection,
     *,
+    f1032: str,
     f91: str,
+    f02: str,
     f27: str,
-    step: str,
-    vendor_name: str = "",
-    status_txt: str = "SUCCESS",
-    message: str = "",
-    dept: Optional[int] = None,
-    f1032: int = 0,
+    f334: str,
+    f29: str,
+    f1081: Optional[str],
+    f03: Optional[int],
 ):
     """
-    Uses MERGE to update/insert dbo.RAVYX_PO_STATUS.
-    For SUCCESS, stores NULL in F1081 to keep report clean.
-    """
-    f91 = _clip(f91, 20)
-    f27 = _clip(f27, 14)
-    step = _clip(step, 40)
-    vendor_name = _clip(vendor_name, 60)
-    status_txt = _clip(status_txt, 60)
+    Insert/Update dbo.RAVYX_PO_STATUS.
 
-    msg_db = None if (status_txt or "").strip().upper() == "SUCCESS" else _clip(message, 5000)
-    now = datetime.now()
-    dept_i = None if dept is None else _safe_int(dept, 0)
-    f1032_i = _safe_int(f1032, 0)
+    - Key: (F1032, F27, F02) so we can have multiple steps per PO.
+    - For SUCCESS => F1081 = NULL (clean report).
+    """
+    f1032_s = _clip(f1032, 20)
+    f91_s = _clip(f91, 20)
+    f02_s = _clip(f02, 60)
+    f27_s = _clip(f27, 14)
+    f334_s = _clip(f334, 60)
+    f29_s = _clip(f29, 60)
+
+    msg_db = None if f29_s.upper() == "SUCCESS" else _clip(f1081, 5000)
+    dept_i = None if f03 is None else int(f03)
 
     sql = """
     MERGE dbo.RAVYX_PO_STATUS AS T
-    USING (SELECT ? AS F91, ? AS F27) AS S
-      ON (T.F91 = S.F91 AND T.F27 = S.F27)
+    USING (SELECT ? AS F1032, ? AS F27, ? AS F02) AS S
+      ON (T.F1032 = S.F1032 AND T.F27 = S.F27 AND T.F02 = S.F02)
     WHEN MATCHED THEN
       UPDATE SET
+        T.F91   = ?,
+        T.F334  = ?,
         T.F254  = ?,
-        T.F02   = ?,
         T.F29   = ?,
         T.F1081 = ?,
-        T.F334  = ?,
-        T.F03   = COALESCE(?, T.F03),
-        T.F1032 = CASE WHEN (T.F1032 IS NULL OR T.F1032 = 0) THEN ? ELSE T.F1032 END
+        T.F03   = COALESCE(?, T.F03)
     WHEN NOT MATCHED THEN
       INSERT (F1032, F91, F02, F27, F334, F254, F29, F1081, F03)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
     """
+    now = datetime.now()
     params = (
-        f91,
-        f27,
+        f1032_s,
+        f27_s,
+        f02_s,
+        f91_s,
+        f334_s,
         now,
-        step,
-        status_txt,
+        f29_s,
         msg_db,
-        vendor_name,
         dept_i,
-        f1032_i,
-        f1032_i,
-        f91,
-        step,
-        f27,
-        vendor_name,
+        f1032_s,
+        f91_s,
+        f02_s,
+        f27_s,
+        f334_s,
         now,
-        status_txt,
+        f29_s,
         msg_db,
         dept_i,
     )
-
     cur = conn.cursor()
     cur.execute(sql, params)
     conn.commit()
@@ -457,30 +457,36 @@ def run_job(args) -> int:
         cur.close()
         return out
 
-    # ---------------------------
-    # FIXED: Update REC_REG using CS/EA logic like Lipari
-    # ---------------------------
+    def get_department_for_po(conn, po_number: str) -> Optional[int]:
+        """
+        Try to find a department number for reporting (F03).
+        We pick the first non-zero department from REC_REG lines.
+        """
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"""
+                SELECT TOP 1 ISNULL(F03,0)
+                FROM [{DB_NAME}].[dbo].[REC_REG]
+                WHERE F1032 = ?
+                  AND F1067 = 'ITEM'
+                  AND ISNULL(F1069,0) = 0
+                  AND ISNULL(F03,0) <> 0
+                """,
+                (po_number,),
+            )
+            row = cur.fetchone()
+            cur.close()
+            if row and row[0] is not None:
+                d = _safe_int(row[0], 0)
+                return d if d > 0 else None
+        except Exception:
+            pass
+        return None
+
     def update_rec_reg_from_unfi(conn, po_number: str, details: List[Dict[str, Any]]) -> Tuple[int, int]:
         """
-        Updates REC_REG based on UNFI line UOM, matching Lipari behavior:
-
-        If UOM is CS/CASE:
-          - qty = cases
-          - cost = cost per case
-          - F75 = cases
-          - F64 = cases * F19
-          - F38 = cost per case
-          - F1140 = cost per unit = F38 / F19
-          - F65 = total = cases * F38
-
-        If UOM is EA/EACH (or unknown -> EA):
-          - qty = units
-          - cost = unit cost
-          - F64 = units
-          - F75 = units / F19 (decimal)
-          - F1140 = unit cost
-          - F38 = cost per case = unit_cost * F19
-          - F65 = total = units * unit_cost
+        Updates REC_REG with CS/EA logic (same idea as Lipari).
         """
         updated = 0
         missing = 0
@@ -529,7 +535,6 @@ def run_job(args) -> int:
                 pack = 1
 
             is_case = uom in ("cs", "case", "cases", "ctn", "carton")
-            is_each = uom in ("ea", "each", "unit", "units")
 
             if is_case:
                 cases = int(qty)
@@ -544,9 +549,8 @@ def run_job(args) -> int:
                 f38 = float(case_cost)
                 f1140 = float(unit_cost)
                 f65 = float(total_cost)
-
             else:
-                # default to EA if not clearly CS
+                # default to EA if not CS
                 units = int(qty)
                 unit_cost = float(cost)
                 total_cost = unit_cost * float(units)
@@ -757,21 +761,23 @@ def run_job(args) -> int:
                 continue
 
             for po, guid in orders:
+                dept_for_status = get_department_for_po(conn, po)
+
                 try:
                     log_info(f"Processing PO={po} vendor={f27} guid={guid}")
 
-                    # optional "started" ping
+                    # STARTED (best effort) -> F02=Invoicing
                     try:
-                        upsert_po_status(
+                        upsert_ravyx_po_status(
                             conn,
+                            f1032=po,
                             f91=po,
+                            f02="Invoicing",
                             f27=f27,
-                            step="GetSPSInvoices",
-                            vendor_name=vendor_name_db,
-                            status_txt="SUCCESS",
-                            message="Processing started",
-                            dept=None,
-                            f1032=_safe_int(po, 0),
+                            f334=vendor_name_db,
+                            f29="SUCCESS",
+                            f1081=None,
+                            f03=dept_for_status,
                         )
                     except Exception:
                         pass
@@ -781,7 +787,7 @@ def run_job(args) -> int:
                     if not details:
                         raise RuntimeError("UNFI order has no details lines")
 
-                    # 1) Update REC_REG qty/costs (fixed)
+                    # 1) Update REC_REG qty/costs
                     updated_rows, missing_rows = update_rec_reg_from_unfi(conn, po, details)
                     log_info(f"PO={po}: REC_REG updated_rows={updated_rows} missing_rows={missing_rows}")
 
@@ -806,18 +812,18 @@ def run_job(args) -> int:
                     # 3) Queue for SMS close: set RECV + RTC
                     set_hdr_ready_to_close(conn, po)
 
-                    # 4) Report
+                    # 4) Report SUCCESS -> F02=Invoicing, clean F1081
                     try:
-                        upsert_po_status(
+                        upsert_ravyx_po_status(
                             conn,
+                            f1032=po,
                             f91=po,
+                            f02="Invoicing",
                             f27=f27,
-                            step="RTC",
-                            vendor_name=vendor_name_db,
-                            status_txt="SUCCESS",
-                            message=f"Posted Invafresh OK | REC_REG updated={updated_rows} missing={missing_rows}",
-                            dept=None,
-                            f1032=_safe_int(po, 0),
+                            f334=vendor_name_db,
+                            f29="SUCCESS",
+                            f1081=None,
+                            f03=dept_for_status,
                         )
                     except Exception:
                         pass
@@ -829,17 +835,18 @@ def run_job(args) -> int:
                     failed += 1
                     log_error(f"FAILED PO={po}: {type(e).__name__}: {e}")
 
+                    # Report FAILED -> F02=Invoicing with message in F1081
                     try:
-                        upsert_po_status(
+                        upsert_ravyx_po_status(
                             conn,
+                            f1032=po,
                             f91=po,
+                            f02="Invoicing",
                             f27=f27,
-                            step="GetSPSInvoices",
-                            vendor_name=vendor_name_db,
-                            status_txt="FAILED",
-                            message=f"{type(e).__name__}: {e}",
-                            dept=None,
-                            f1032=_safe_int(po, 0),
+                            f334=vendor_name_db,
+                            f29="FAILED",
+                            f1081=f"{type(e).__name__}: {e}",
+                            f03=dept_for_status,
                         )
                     except Exception:
                         pass
